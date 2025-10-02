@@ -604,6 +604,8 @@ pub use client::ClientConnection;
 
 /// Items for use in a server.
 pub mod server {
+    #[cfg(feature = "acme")]
+    pub mod acme;
     pub(crate) mod builder;
     pub(crate) mod handy;
     mod hs;
