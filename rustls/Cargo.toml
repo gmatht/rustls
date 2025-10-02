@@ -16,7 +16,7 @@ exclude = ["src/testdata", "tests/**"]
 [features]
 default = ["log", "std"]
 
-acme = ["dep:acme-lib", "dep:hickory-resolver", "dep:tokio", "dep:serde", "dep:serde_json", "dep:base64", "dep:sha2", "dep:rand", "std"]
+acme = ["dep:acme-lib", "dep:hickory-resolver", "dep:tokio", "dep:serde", "dep:serde_json", "dep:base64", "dep:sha2", "dep:rand", "dep:rcgen", "dep:time", "std"]
 aws-lc-rs = ["dep:aws-lc-rs", "webpki/aws-lc-rs", "aws-lc-rs/aws-lc-sys", "aws-lc-rs/prebuilt-nasm"]
 brotli = ["dep:brotli", "dep:brotli-decompressor", "std"]
 custom-provider = []
@@ -38,12 +38,14 @@ log = { workspace = true, optional = true }
 # only required for no-std
 once_cell = { workspace = true }
 rand = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 subtle = { workspace = true }
 tokio = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
 webpki = { workspace = true }
 pki-types = { workspace = true }
 zeroize = { workspace = true }
@@ -60,7 +62,6 @@ rcgen = { workspace = true }
 rustls-test = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-time = { workspace = true }
 webpki-roots = { workspace = true }
 x509-parser = { workspace = true }
 

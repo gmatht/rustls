@@ -6,6 +6,9 @@ license = "Apache-2.0 OR ISC OR MIT"
 description = "Rustls example code and tests."
 publish = false
 
+[features]
+acme = []
+
 [dependencies]
 clap = { workspace = true }
 env_logger = { workspace = true }
