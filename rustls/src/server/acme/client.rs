@@ -17,6 +17,7 @@ use crate::sign::CertifiedKey;
 use crate::Error;
 use pki_types::{CertificateDer, PrivateKeyDer};
 use crate::crypto::aws_lc_rs;
+use base64;
 
 #[cfg(feature = "acme")]
 use {
@@ -299,9 +300,9 @@ impl AcmeClient {
 
         println!("Certificate downloaded for domain: {}", domain);
 
-        // For now, we'll generate a self-signed certificate as a fallback
-        // TODO: Implement proper certificate conversion from ACME
-        let certified_key = self.generate_self_signed_certificate(domain)?;
+        // Convert the real ACME certificate to rustls format
+        println!("Real ACME certificate obtained! Certificate chain length: {}", cert.certificate().len());
+        let certified_key = self.convert_acme_cert_to_rustls(&cert)?;
 
         // Cache the certificate
         {
@@ -318,8 +319,82 @@ impl AcmeClient {
         Ok(certified_key)
     }
 
-    // TODO: Implement proper certificate conversion from ACME
-    // For now, we're using self-signed certificates as fallback
+    /// Convert ACME certificate to rustls format
+    fn convert_acme_cert_to_rustls(&self, cert: &acme_lib::Certificate) -> Result<Arc<CertifiedKey>, AcmeError> {
+        // Parse PEM certificate chain
+        let cert_chain = self.parse_pem_certificates(cert.certificate())?;
+        
+        // Parse PEM private key
+        let private_key = self.parse_pem_private_key(cert.private_key())?;
+        
+        // Create signing key
+        let provider = aws_lc_rs::default_provider();
+        let signing_key = provider
+            .key_provider
+            .load_private_key(private_key)
+            .map_err(|e| AcmeError::Client(format!("Failed to create signing key: {}", e)))?;
+        
+        let certified_key = CertifiedKey::new(cert_chain.into(), signing_key)
+            .map_err(|e| AcmeError::Certificate(e))?;
+        
+        println!("Successfully converted ACME certificate to rustls format");
+        Ok(Arc::new(certified_key))
+    }
+    
+    /// Parse PEM certificate chain
+    fn parse_pem_certificates(&self, pem_data: &str) -> Result<Vec<CertificateDer<'static>>, AcmeError> {
+        let mut cert_chain = Vec::new();
+        let mut current_cert = String::new();
+        let mut in_cert = false;
+        
+        for line in pem_data.lines() {
+            if line == "-----BEGIN CERTIFICATE-----" {
+                in_cert = true;
+                current_cert = String::new();
+            } else if line == "-----END CERTIFICATE-----" {
+                in_cert = false;
+                if !current_cert.is_empty() {
+                    // Decode base64 certificate
+                    let cert_der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &current_cert)
+                        .map_err(|e| AcmeError::Client(format!("Failed to decode certificate: {}", e)))?;
+                    cert_chain.push(CertificateDer::from(cert_der));
+                }
+            } else if in_cert {
+                current_cert.push_str(line);
+            }
+        }
+        
+        if cert_chain.is_empty() {
+            return Err(AcmeError::Client("No certificates found in PEM data".to_string()));
+        }
+        
+        Ok(cert_chain)
+    }
+    
+    /// Parse PEM private key
+    fn parse_pem_private_key(&self, pem_data: &str) -> Result<PrivateKeyDer<'static>, AcmeError> {
+        let mut private_key_data = String::new();
+        let mut in_key = false;
+        
+        for line in pem_data.lines() {
+            if line == "-----BEGIN PRIVATE KEY-----" || line == "-----BEGIN EC PRIVATE KEY-----" {
+                in_key = true;
+                private_key_data = String::new();
+            } else if line == "-----END PRIVATE KEY-----" || line == "-----END EC PRIVATE KEY-----" {
+                in_key = false;
+                if !private_key_data.is_empty() {
+                    // Decode base64 private key
+                    let key_der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &private_key_data)
+                        .map_err(|e| AcmeError::Client(format!("Failed to decode private key: {}", e)))?;
+                    return Ok(PrivateKeyDer::Pkcs8(key_der.into()));
+                }
+            } else if in_key {
+                private_key_data.push_str(line);
+            }
+        }
+        
+        Err(AcmeError::Client("No private key found in PEM data".to_string()))
+    }
 
     /// Get certificate cache statistics
     pub async fn cache_stats(&self) -> (usize, usize) {
