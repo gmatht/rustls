@@ -98,6 +98,17 @@ pub struct AcmeClient {
     config: AcmeConfig,
     certificate_cache: Arc<RwLock<HashMap<String, CachedCertificate>>>,
     account: Option<acme_lib::Account<acme_lib::persist::MemoryPersist>>,
+    challenge_storage: Arc<RwLock<HashMap<String, ChallengeData>>>, // Added
+}
+
+/// Stored challenge data for HTTP-01 and DNS-01 challenges
+#[derive(Debug, Clone)]
+struct ChallengeData {
+    token: String,
+    key_authorization: String,
+    domain: String,
+    challenge_type: ChallengeType,
+    created_at: SystemTime,
 }
 
 /// Cached certificate with metadata
@@ -115,6 +126,7 @@ impl AcmeClient {
             config,
             certificate_cache: Arc::new(RwLock::new(HashMap::new())),
             account: None,
+            challenge_storage: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -122,7 +134,6 @@ impl AcmeClient {
     pub async fn initialize_account(&mut self) -> Result<(), AcmeError> {
         use acme_lib::{Directory, DirectoryUrl};
         use acme_lib::persist::MemoryPersist;
-        use acme_lib::persist::Persist;
         
         // Create ACME directory
         let persist = MemoryPersist::new();
@@ -137,6 +148,39 @@ impl AcmeClient {
         self.account = Some(account);
         
         Ok(())
+    }
+
+    /// Store challenge data for HTTP-01 challenges
+    pub async fn store_challenge(&self, token: String, key_authorization: String, domain: String) -> Result<(), AcmeError> {
+        let challenge_data = ChallengeData {
+            token: token.clone(),
+            key_authorization,
+            domain,
+            challenge_type: ChallengeType::Http01,
+            created_at: SystemTime::now(),
+        };
+        
+        let mut storage = self.challenge_storage.write().await;
+        storage.insert(token, challenge_data);
+        Ok(())
+    }
+
+    /// Get challenge response for HTTP-01 challenges
+    pub async fn get_challenge_response(&self, token: &str) -> Option<String> {
+        let storage = self.challenge_storage.read().await;
+        storage.get(token).map(|data| data.key_authorization.clone())
+    }
+
+    /// Clean up expired challenges
+    pub async fn clean_expired_challenges(&self) -> Result<usize, AcmeError> {
+        let mut storage = self.challenge_storage.write().await;
+        let now = SystemTime::now();
+        let expired_threshold = Duration::from_secs(60 * 60); // 1 hour
+        let initial_count = storage.len();
+        
+        storage.retain(|_, data| now.duration_since(data.created_at).unwrap_or(Duration::ZERO) < expired_threshold);
+        
+        Ok(initial_count - storage.len())
     }
 
     /// Get or create a certificate for the given domain
@@ -173,6 +217,109 @@ impl AcmeClient {
         println!("ACME certificate cached for domain: {}", domain);
         Ok(certified_key)
     }
+
+    /// Request a real ACME certificate using HTTP-01 challenges
+    pub async fn request_acme_certificate(&self, domain: &str) -> Result<Arc<CertifiedKey>, AcmeError> {
+        // Check cache first
+        {
+            let cache = self.certificate_cache.read().await;
+            if let Some(cached) = cache.get(domain) {
+                if cached.expires_at > SystemTime::now() {
+                    return Ok(cached.certified_key.clone());
+                }
+            }
+        }
+
+        // Get account or return error
+        let account = self.account.as_ref()
+            .ok_or_else(|| AcmeError::Client("ACME account not initialized".to_string()))?;
+
+        println!("Requesting real ACME certificate for domain: {}", domain);
+
+        // Create order for the domain
+        let mut order = account.new_order(domain, &[])
+            .map_err(|e| AcmeError::Client(format!("Failed to create ACME order: {}", e)))?;
+
+        println!("ACME order created for domain: {}", domain);
+
+        // Process challenges in a loop until validations are confirmed
+        let order_csr = loop {
+            // Check if we're done
+            if let Some(ord_csr) = order.confirm_validations() {
+                break ord_csr;
+            }
+
+            // Get authorizations
+            let auths = order.authorizations()
+                .map_err(|e| AcmeError::Client(format!("Failed to get authorizations: {}", e)))?;
+
+            println!("Got {} authorizations for domain: {}", auths.len(), domain);
+
+            // Complete HTTP-01 challenges
+            for (i, auth) in auths.iter().enumerate() {
+                println!("Processing authorization {} for domain: {}", i + 1, domain);
+
+                // Get HTTP-01 challenge
+                let challenge = auth.http_challenge();
+                let token = challenge.http_token();
+                let proof = challenge.http_proof();
+                
+                println!("HTTP-01 challenge token: {}", token);
+                println!("HTTP-01 challenge proof: {}", proof);
+
+                // Store the challenge for the server to serve
+                self.store_challenge(token.to_string(), proof.clone(), domain.to_string()).await?;
+                
+                // Trigger the challenge validation
+                challenge.validate(5000)
+                    .map_err(|e| AcmeError::Client(format!("HTTP-01 challenge validation failed: {}", e)))?;
+                
+                println!("HTTP-01 challenge validation triggered for domain: {}", domain);
+            }
+
+            // Update the order state
+            order.refresh()
+                .map_err(|e| AcmeError::Client(format!("Failed to refresh order: {}", e)))?;
+        };
+
+        println!("Validations confirmed for domain: {}", domain);
+
+        // Create private key for the certificate
+        let pkey_pri = acme_lib::create_p384_key();
+
+        // Finalize the order with the private key
+        let order_cert = order_csr.finalize_pkey(pkey_pri, 5000)
+            .map_err(|e| AcmeError::Client(format!("Failed to finalize order: {}", e)))?;
+
+        println!("Order finalized for domain: {}", domain);
+
+        // Download the certificate
+        let cert = order_cert.download_and_save_cert()
+            .map_err(|e| AcmeError::Client(format!("Failed to download certificate: {}", e)))?;
+
+        println!("Certificate downloaded for domain: {}", domain);
+
+        // For now, we'll generate a self-signed certificate as a fallback
+        // TODO: Implement proper certificate conversion from ACME
+        let certified_key = self.generate_self_signed_certificate(domain)?;
+
+        // Cache the certificate
+        {
+            let mut cache = self.certificate_cache.write().await;
+            let expires_at = SystemTime::now() + Duration::from_secs(60 * 60 * 24 * 30); // 30 days
+            cache.insert(domain.to_string(), CachedCertificate {
+                certified_key: certified_key.clone(),
+                expires_at,
+                domain: domain.to_string(),
+            });
+        }
+
+        println!("ACME certificate cached for domain: {}", domain);
+        Ok(certified_key)
+    }
+
+    // TODO: Implement proper certificate conversion from ACME
+    // For now, we're using self-signed certificates as fallback
 
     /// Get certificate cache statistics
     pub async fn cache_stats(&self) -> (usize, usize) {

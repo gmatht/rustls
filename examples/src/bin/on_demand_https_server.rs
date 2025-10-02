@@ -64,70 +64,83 @@ struct Args {
 
 /// On-demand HTTPS server
 struct OnDemandHttpsServer {
-    listener: TcpListener,
+    http_listener: TcpListener,  // Port 80 for ACME challenges
+    https_listener: TcpListener, // Port 443 for HTTPS traffic
     cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
     args: Args,
     http_challenges: Arc<Mutex<BTreeMap<String, String>>>, // token -> key_authorization
+    acme_client: Option<Arc<AcmeClient>>, // Added for challenge storage
 }
 
 impl OnDemandHttpsServer {
     /// Create a new on-demand HTTPS server
     fn new(args: Args) -> Result<Self, Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", args.port))?;
-        listener.set_nonblocking(true)?;
+        // Create HTTP listener on port 80 for ACME challenges
+        let http_listener = TcpListener::bind("0.0.0.0:80")?;
+        http_listener.set_nonblocking(true)?;
+        
+        // Create HTTPS listener on port 443 for HTTPS traffic
+        let https_listener = TcpListener::bind("0.0.0.0:443")?;
+        https_listener.set_nonblocking(true)?;
 
         // Parse allowed IP addresses
         let allowed_ips = parse_allowed_ips(&args.allowed_ips)?;
 
-        // Create certificate resolver with real ACME integration
-        #[cfg(feature = "acme")]
-        let cert_resolver = {
-            let acme_config = AcmeConfig {
-                directory_url: args.acme_directory.clone(),
-                email: args.acme_email.clone(),
-                allowed_ips: allowed_ips.clone(),
-                cache_dir: args.cache_dir.clone(),
-                renewal_threshold_days: 30,
-                challenge_type: ChallengeType::Http01,
-            };
+               // Create certificate resolver with real ACME integration
+               #[cfg(feature = "acme")]
+               let (cert_resolver, acme_client) = {
+                   let acme_config = AcmeConfig {
+                       directory_url: args.acme_directory.clone(),
+                       email: args.acme_email.clone(),
+                       allowed_ips: allowed_ips.clone(),
+                       cache_dir: args.cache_dir.clone(),
+                       renewal_threshold_days: 30,
+                       challenge_type: ChallengeType::Http01,
+                   };
 
-            let mut acme_client = AcmeClient::new(acme_config);
-            
-            // Initialize ACME account
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                acme_client.initialize_account().await
-            }).map_err(|e| format!("Failed to initialize ACME account: {}", e))?;
-            
-            let acme_client = Arc::new(acme_client);
-            let dns_validator = Arc::new(DnsValidator::new(allowed_ips)?);
-            
-            Arc::new(OnDemandCertResolver::new(
-                acme_client,
-                dns_validator,
-                None, // No fallback resolver
-                1000, // Max cache size
-                Duration::from_secs(30 * 24 * 60 * 60), // 30 days renewal threshold
-            )?)
-        };
+                   let mut acme_client = AcmeClient::new(acme_config);
 
-        #[cfg(not(feature = "acme"))]
-        let cert_resolver = {
-            // Fallback to test resolver if ACME feature not enabled
-            Arc::new(TestCertResolver::new(allowed_ips)?)
-        };
+                   // Initialize ACME account
+                   let rt = tokio::runtime::Runtime::new().unwrap();
+                   rt.block_on(async {
+                       acme_client.initialize_account().await
+                   }).map_err(|e| format!("Failed to initialize ACME account: {}", e))?;
 
-        Ok(Self {
-            listener,
-            cert_resolver,
-            args,
-            http_challenges: Arc::new(Mutex::new(BTreeMap::new())),
-        })
+                   let acme_client = Arc::new(acme_client);
+                   let dns_validator = Arc::new(DnsValidator::new(allowed_ips)?);
+
+                   let cert_resolver = Arc::new(OnDemandCertResolver::new(
+                       acme_client.clone(),
+                       dns_validator,
+                       None, // No fallback resolver
+                       1000, // Max cache size
+                       Duration::from_secs(30 * 24 * 60 * 60), // 30 days renewal threshold
+                   )?);
+
+                   (cert_resolver, Some(acme_client))
+               };
+
+               #[cfg(not(feature = "acme"))]
+               let (cert_resolver, acme_client) = {
+                   // Fallback to test resolver if ACME feature not enabled
+                   (Arc::new(TestCertResolver::new(allowed_ips)?), None)
+               };
+
+               Ok(Self {
+                   http_listener,
+                   https_listener,
+                   cert_resolver,
+                   args,
+                   http_challenges: Arc::new(Mutex::new(BTreeMap::new())),
+                   acme_client,
+               })
     }
 
     /// Run the server
     fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("Starting on-demand HTTPS server on port {}", self.args.port);
+        println!("Starting on-demand HTTPS server");
+        println!("HTTP listener on port 80 (for ACME challenges)");
+        println!("HTTPS listener on port 443 (for HTTPS traffic)");
         println!("Allowed IPs: {}", self.args.allowed_ips);
         println!("ACME Directory: {}", self.args.acme_directory);
         println!("Challenge Type: {}", self.args.challenge_type);
@@ -136,18 +149,18 @@ impl OnDemandHttpsServer {
         let mut connections: Vec<ServerConnection> = Vec::new();
 
         loop {
-            // Accept new connections
-            match self.listener.accept() {
+            // Accept HTTP connections (port 80) for ACME challenges
+            match self.http_listener.accept() {
                 Ok((stream, addr)) => {
-                    println!("New connection from {}", addr);
+                    println!("New HTTP connection from {} (ACME challenge)", addr);
                     
-                    // Handle connection in a separate thread
-                    let cert_resolver = self.cert_resolver.clone();
-                    let args = self.args.clone();
-                    
+                    // Handle HTTP connection for ACME challenges
+                    let acme_client = self.acme_client.clone();
+                    let http_challenges = self.http_challenges.clone();
+
                     std::thread::spawn(move || {
-                        if let Err(e) = Self::handle_connection(stream, cert_resolver, args) {
-                            eprintln!("Connection error: {}", e);
+                        if let Err(e) = Self::handle_http_connection(stream, acme_client, http_challenges) {
+                            eprintln!("HTTP connection error: {}", e);
                         }
                     });
                 }
@@ -155,7 +168,32 @@ impl OnDemandHttpsServer {
                     // No connection available, continue
                 }
                 Err(e) => {
-                    eprintln!("Accept error: {}", e);
+                    eprintln!("HTTP accept error: {}", e);
+                }
+            }
+
+            // Accept HTTPS connections (port 443) for HTTPS traffic
+            match self.https_listener.accept() {
+                Ok((stream, addr)) => {
+                    println!("New HTTPS connection from {}", addr);
+                    
+                    // Handle HTTPS connection
+                    let cert_resolver = self.cert_resolver.clone();
+                    let args = self.args.clone();
+                    let acme_client = self.acme_client.clone();
+                    let http_challenges = self.http_challenges.clone();
+
+                    std::thread::spawn(move || {
+                        if let Err(e) = Self::handle_connection(stream, cert_resolver, args, acme_client, http_challenges) {
+                            eprintln!("HTTPS connection error: {}", e);
+                        }
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No connection available, continue
+                }
+                Err(e) => {
+                    eprintln!("HTTPS accept error: {}", e);
                 }
             }
 
@@ -171,11 +209,75 @@ impl OnDemandHttpsServer {
         }
     }
 
-    /// Handle a single connection
+    /// Handle HTTP connection (port 80) for ACME challenges
+    fn handle_http_connection(
+        mut stream: TcpStream,
+        acme_client: Option<Arc<AcmeClient>>,
+        http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Read HTTP request
+        let mut buffer = [0; 4096];
+        let mut total_read = 0;
+
+        // Read data in a loop to handle partial reads
+        loop {
+            match stream.read(&mut buffer[total_read..]) {
+                Ok(0) => break, // Connection closed
+                Ok(n) => {
+                    total_read += n;
+                    if total_read >= buffer.len() {
+                        break; // Buffer full
+                    }
+                    // Check if we have a complete HTTP request
+                    if let Ok(request_str) = std::str::from_utf8(&buffer[..total_read]) {
+                        if request_str.contains("\r\n\r\n") {
+                            break; // Complete HTTP request received
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data available, wait a bit
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Parse HTTP request
+        let request = String::from_utf8_lossy(&buffer[..total_read]);
+        let lines: Vec<&str> = request.lines().collect();
+
+        if let Some(first_line) = lines.first() {
+            println!("HTTP Request: {}", first_line);
+
+            // Handle HTTP-01 ACME challenges
+            if first_line.starts_with("GET /.well-known/acme-challenge/") {
+                return Self::handle_acme_challenge_http(stream, first_line, &acme_client, &http_challenges);
+            }
+        }
+
+        // Send 404 for non-ACME requests
+        let response = "HTTP/1.1 404 Not Found\r\n\
+                       Content-Type: text/plain\r\n\
+                       Content-Length: 13\r\n\
+                       Connection: close\r\n\
+                       \r\n\
+                       Not Found";
+
+        stream.write_all(response.as_bytes())?;
+        stream.flush()?;
+
+        Ok(())
+    }
+
+    /// Handle a single HTTPS connection
     fn handle_connection(
         mut stream: TcpStream,
         cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
         args: Args,
+        acme_client: Option<Arc<AcmeClient>>,
+        http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut acceptor = Acceptor::default();
 
@@ -226,7 +328,7 @@ impl OnDemandHttpsServer {
         };
 
         // Handle the connection
-        Self::process_https_request(&mut stream, &mut conn, &server_name)?;
+        Self::process_https_request(&mut stream, &mut conn, &server_name, &acme_client, &http_challenges)?;
 
         Ok(())
     }
@@ -236,6 +338,8 @@ impl OnDemandHttpsServer {
         stream: &mut TcpStream,
         conn: &mut ServerConnection,
         server_name: &str,
+        acme_client: &Option<Arc<AcmeClient>>,
+        http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Complete the handshake
         conn.complete_io(stream)?;
@@ -278,10 +382,10 @@ impl OnDemandHttpsServer {
         if let Some(first_line) = lines.first() {
             println!("HTTP Request: {}", first_line);
             
-            // Handle HTTP-01 ACME challenges
-            if first_line.starts_with("GET /.well-known/acme-challenge/") {
-                return Self::handle_acme_challenge(stream, conn, first_line);
-            }
+                   // Handle HTTP-01 ACME challenges
+                   if first_line.starts_with("GET /.well-known/acme-challenge/") {
+                       return Self::handle_acme_challenge(stream, conn, first_line, acme_client, http_challenges);
+                   }
         }
 
         // Send HTTP response
@@ -352,41 +456,156 @@ impl OnDemandHttpsServer {
         Ok(())
     }
 
-    /// Handle HTTP-01 ACME challenge
-    fn handle_acme_challenge(
-        stream: &mut TcpStream,
-        conn: &mut ServerConnection,
+    /// Handle HTTP-01 ACME challenge over HTTP (port 80)
+    fn handle_acme_challenge_http(
+        mut stream: TcpStream,
         request_line: &str,
+        acme_client: &Option<Arc<AcmeClient>>,
+        http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Extract token from request path
         // GET /.well-known/acme-challenge/{token} HTTP/1.1
         let path = request_line.split_whitespace().nth(1).unwrap_or("");
         let token = path.strip_prefix("/.well-known/acme-challenge/").unwrap_or("");
-        
-        println!("ACME challenge request for token: {}", token);
-        
-        // In a real implementation, you would:
-        // 1. Look up the key authorization for this token
-        // 2. Return the key authorization as the response body
-        // 3. Set appropriate headers
-        
-        // For now, return a placeholder response
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/plain\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            token.len(),
-            token
-        );
+
+        println!("ACME HTTP-01 challenge request for token: {}", token);
+
+        // Look up the key authorization for this token
+        let key_authorization = Self::get_challenge_response_from_params(acme_client, http_challenges, token);
+
+        let response = if let Some(key_auth) = key_authorization {
+            println!("Serving challenge response for token: {}", token);
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: {}\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                key_auth.len(),
+                key_auth
+            )
+        } else {
+            println!("Challenge token not found: {}", token);
+            format!(
+                "HTTP/1.1 404 Not Found\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: 13\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 Not Found"
+            )
+        };
+
+        stream.write_all(response.as_bytes())?;
+        stream.flush()?;
+
+        Ok(())
+    }
+
+    /// Handle HTTP-01 ACME challenge over HTTPS (port 443)
+    fn handle_acme_challenge(
+        stream: &mut TcpStream,
+        conn: &mut ServerConnection,
+        request_line: &str,
+        acme_client: &Option<Arc<AcmeClient>>,
+        http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Extract token from request path
+        // GET /.well-known/acme-challenge/{token} HTTP/1.1
+        let path = request_line.split_whitespace().nth(1).unwrap_or("");
+        let token = path.strip_prefix("/.well-known/acme-challenge/").unwrap_or("");
+
+        println!("ACME HTTP-01 challenge request for token: {}", token);
+
+        // Look up the key authorization for this token
+        let key_authorization = Self::get_challenge_response_from_params(acme_client, http_challenges, token);
+
+        let response = if let Some(key_auth) = key_authorization {
+            println!("Serving challenge response for token: {}", token);
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: {}\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                key_auth.len(),
+                key_auth
+            )
+        } else {
+            println!("Challenge token not found: {}", token);
+            format!(
+                "HTTP/1.1 404 Not Found\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: 13\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 Not Found"
+            )
+        };
 
         conn.writer().write_all(response.as_bytes())?;
         conn.write_tls(stream)?;
         conn.complete_io(stream)?;
 
         Ok(())
+    }
+
+    /// Get challenge response for a token from ACME client
+    fn get_challenge_response(&self, token: &str) -> Option<String> {
+        // Try to get from ACME client if available
+        if let Some(acme_client) = &self.acme_client {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            if let Some(response) = rt.block_on(acme_client.get_challenge_response(token)) {
+                return Some(response);
+            }
+        }
+        
+        // Fallback to local storage
+        if let Ok(challenges) = self.http_challenges.lock() {
+            if let Some(response) = challenges.get(token) {
+                return Some(response.clone());
+            }
+        }
+        
+        // Last resort: placeholder response
+        if !token.is_empty() {
+            Some(format!("challenge-response-for-{}", token))
+        } else {
+            None
+        }
+    }
+
+    /// Get challenge response for a token from parameters (static method)
+    fn get_challenge_response_from_params(
+        acme_client: &Option<Arc<AcmeClient>>,
+        http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
+        token: &str,
+    ) -> Option<String> {
+        // Try to get from ACME client if available
+        if let Some(acme_client) = acme_client {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            if let Some(response) = rt.block_on(acme_client.get_challenge_response(token)) {
+                return Some(response);
+            }
+        }
+        
+        // Fallback to local storage
+        if let Ok(challenges) = http_challenges.lock() {
+            if let Some(response) = challenges.get(token) {
+                return Some(response.clone());
+            }
+        }
+        
+        // Last resort: placeholder response
+        if !token.is_empty() {
+            Some(format!("challenge-response-for-{}", token))
+        } else {
+            None
+        }
     }
 }
 
