@@ -10,7 +10,7 @@
 //! Usage:
 //!   cargo run --example on_demand_https_server --features acme -- --help
 
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -38,7 +38,7 @@ struct Args {
     allowed_ips: String,
 
     /// ACME directory URL
-    #[arg(long, default_value = "https://acme-v02.api.letsencrypt.org/directory")]
+    #[arg(long, default_value = "https://acme-staging-v02.api.letsencrypt.org/directory")]
     acme_directory: String,
 
     /// Email address for ACME account
@@ -67,6 +67,7 @@ struct OnDemandHttpsServer {
     listener: TcpListener,
     cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
     args: Args,
+    http_challenges: Arc<Mutex<BTreeMap<String, String>>>, // token -> key_authorization
 }
 
 impl OnDemandHttpsServer {
@@ -90,7 +91,15 @@ impl OnDemandHttpsServer {
                 challenge_type: ChallengeType::Http01,
             };
 
-            let acme_client = Arc::new(AcmeClient::new(acme_config));
+            let mut acme_client = AcmeClient::new(acme_config);
+            
+            // Initialize ACME account
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                acme_client.initialize_account().await
+            }).map_err(|e| format!("Failed to initialize ACME account: {}", e))?;
+            
+            let acme_client = Arc::new(acme_client);
             let dns_validator = Arc::new(DnsValidator::new(allowed_ips)?);
             
             Arc::new(OnDemandCertResolver::new(
@@ -112,6 +121,7 @@ impl OnDemandHttpsServer {
             listener,
             cert_resolver,
             args,
+            http_challenges: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -230,16 +240,48 @@ impl OnDemandHttpsServer {
         // Complete the handshake
         conn.complete_io(stream)?;
 
-        // Read HTTP request
+        // Read HTTP request using the TLS connection
         let mut buffer = [0; 4096];
-        let n = conn.reader().read(&mut buffer)?;
+        let mut total_read = 0;
+
+        // Read data in a loop to handle partial reads
+        loop {
+            match conn.reader().read(&mut buffer[total_read..]) {
+                Ok(0) => break, // Connection closed
+                Ok(n) => {
+                    total_read += n;
+                    if total_read >= buffer.len() {
+                        break; // Buffer full
+                    }
+                    // Check if we have a complete HTTP request
+                    if let Ok(request_str) = std::str::from_utf8(&buffer[..total_read]) {
+                        if request_str.contains("\r\n\r\n") {
+                            break; // Complete HTTP request received
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data available, wait a bit
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        
+        let n = total_read;
 
         // Parse HTTP request (simplified)
         let request = String::from_utf8_lossy(&buffer[..n]);
         let lines: Vec<&str> = request.lines().collect();
-        
+
         if let Some(first_line) = lines.first() {
             println!("HTTP Request: {}", first_line);
+            
+            // Handle HTTP-01 ACME challenges
+            if first_line.starts_with("GET /.well-known/acme-challenge/") {
+                return Self::handle_acme_challenge(stream, conn, first_line);
+            }
         }
 
         // Send HTTP response
@@ -307,8 +349,40 @@ impl OnDemandHttpsServer {
         conn.write_tls(stream)?;
         conn.complete_io(stream)?;
 
-        // Send close notify
-        conn.send_close_notify();
+        Ok(())
+    }
+
+    /// Handle HTTP-01 ACME challenge
+    fn handle_acme_challenge(
+        stream: &mut TcpStream,
+        conn: &mut ServerConnection,
+        request_line: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Extract token from request path
+        // GET /.well-known/acme-challenge/{token} HTTP/1.1
+        let path = request_line.split_whitespace().nth(1).unwrap_or("");
+        let token = path.strip_prefix("/.well-known/acme-challenge/").unwrap_or("");
+        
+        println!("ACME challenge request for token: {}", token);
+        
+        // In a real implementation, you would:
+        // 1. Look up the key authorization for this token
+        // 2. Return the key authorization as the response body
+        // 3. Set appropriate headers
+        
+        // For now, return a placeholder response
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            token.len(),
+            token
+        );
+
+        conn.writer().write_all(response.as_bytes())?;
         conn.write_tls(stream)?;
         conn.complete_io(stream)?;
 
