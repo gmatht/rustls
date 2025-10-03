@@ -325,6 +325,12 @@ impl OnDemandHttpsServer {
                    // Continue anyway - this is not a fatal error
                }
                
+               // Ensure /tmp/acme_certs directory exists and is owned by www-data (acme-lib requirement)
+               if let Err(e) = ensure_tmp_acme_permissions(www_data_uid, www_data_gid) {
+                   println!("Warning: Failed to set /tmp/acme_certs permissions: {}", e);
+                   // Continue anyway - this is not a fatal error
+               }
+               
                // Drop privileges to unprivileged user after binding to privileged ports
                if let Err(e) = secure_file_server.drop_privileges() {
                    println!("Warning: Failed to drop privileges: {}", e);
@@ -1281,6 +1287,43 @@ impl OnDemandHttpsServer {
     }
 }
 
+
+/// Ensure /tmp/acme_certs directory exists and is owned by www-data (acme-lib requirement)
+fn ensure_tmp_acme_permissions(uid: u32, gid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    
+    let tmp_acme_dir = "/tmp/acme_certs";
+    
+    // Create the directory if it doesn't exist
+    let output = Command::new("mkdir")
+        .args(&["-p", tmp_acme_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to create /tmp/acme_certs directory: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    
+    // Set ownership to www-data
+    let output = Command::new("chown")
+        .args(&["-R", &format!("{}:{}", uid, gid), tmp_acme_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to set ownership of /tmp/acme_certs directory: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    
+    // Set permissions to 755
+    let output = Command::new("chmod")
+        .args(&["-R", "755", tmp_acme_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to set permissions of /tmp/acme_certs directory: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    
+    println!("Certificate cache directory permissions set: {} (owner: {})", tmp_acme_dir, uid);
+    Ok(())
+}
 
 /// Ensure certificate cache directory has proper ownership for www-data
 fn ensure_cert_cache_permissions(cache_dir: &str, uid: u32, gid: u32) -> Result<(), Box<dyn std::error::Error>> {

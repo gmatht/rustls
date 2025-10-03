@@ -228,8 +228,8 @@ impl AcmeClient {
             }
         }
 
-        // Try to load from disk
-        if let Some(certified_key) = self.load_certificate_from_disk(domain).await? {
+        // Try to load from acme-lib's persistence
+        if let Some(certified_key) = self.load_certificate_from_acme_lib(domain).await? {
             // Cache the loaded certificate
             {
                 let mut cache = self.certificate_cache.write().await;
@@ -240,7 +240,7 @@ impl AcmeClient {
                     domain: domain.to_string(),
                 });
             }
-            println!("Loaded certificate from disk for domain: {}", domain);
+            println!("Loaded certificate from acme-lib persistence for domain: {}", domain);
             return Ok(certified_key);
         }
 
@@ -505,7 +505,7 @@ impl AcmeClient {
         println!("✅ Successfully converted ACME certificate to rustls format");
         println!("🔄 About to start caching and saving process for domain: {}", domain);
 
-        // Cache the certificate
+        // Cache the certificate in memory for quick access
         println!("🔄 Caching certificate in memory for domain: {}", domain);
         {
             let mut cache = self.certificate_cache.write().await;
@@ -517,23 +517,7 @@ impl AcmeClient {
             });
         }
         println!("✅ ACME certificate cached in memory for domain: {}", domain);
-
-        // Save certificate to disk
-        println!("🔄 Saving certificate to disk for domain: {}", domain);
-        
-        // Log current working directory and user info for debugging
-        if let Ok(current_dir) = std::env::current_dir() {
-            println!("   Current working directory: {}", current_dir.display());
-        }
-        if let Ok(user) = std::env::var("USER") {
-            println!("   Running as user: {}", user);
-        }
-        
-        println!("🔄 About to call save_certificate_to_disk for domain: {}", domain);
-        self.save_certificate_to_disk(domain, &certified_key, &cert).await?;
-        println!("✅ Successfully saved certificate to disk for domain: {}", domain);
-
-        println!("ACME certificate cached and saved to disk for domain: {}", domain);
+        println!("✅ ACME certificate persisted by acme-lib for domain: {}", domain);
         Ok(certified_key)
     }
 
@@ -624,6 +608,50 @@ impl AcmeClient {
         (total, expired)
     }
 
+    /// Load certificate from acme-lib's persistence
+    async fn load_certificate_from_acme_lib(&self, domain: &str) -> Result<Option<Arc<CertifiedKey>>, AcmeError> {
+        use acme_lib::{Directory, DirectoryUrl};
+        use acme_lib::persist::FilePersist;
+
+        // Create the same directory structure that acme-lib uses
+        let acme_persist_dir = format!("{}/acme_lib", self.config.cache_dir.as_deref().unwrap_or("/tmp/acme_certs"));
+        
+        // Check if the directory exists
+        if !std::path::Path::new(&acme_persist_dir).exists() {
+            return Ok(None);
+        }
+
+        // Create FilePersist instance
+        let persist = FilePersist::new(&acme_persist_dir);
+        let dir = Directory::from_url(persist, DirectoryUrl::Other(&self.config.directory_url))
+            .map_err(|e| AcmeError::Client(format!("Failed to create ACME directory for loading: {}", e)))?;
+
+        // Get domain-specific email
+        let domain_email = self.get_email_for_domain(domain);
+        
+        // Try to load the account and certificate
+        let account = dir.account(&domain_email)
+            .map_err(|e| AcmeError::Client(format!("Failed to load ACME account for {}: {}", domain_email, e)))?;
+
+        // Try to get the certificate from acme-lib's persistence
+        match account.certificate(domain) {
+            Ok(Some(acme_cert)) => {
+                println!("Found certificate in acme-lib persistence for domain: {}", domain);
+                // Convert to rustls format
+                let certified_key = self.convert_acme_cert_to_rustls(&acme_cert)?;
+                Ok(Some(certified_key))
+            }
+            Ok(None) => {
+                println!("No certificate found in acme-lib persistence for domain: {}", domain);
+                Ok(None)
+            }
+            Err(e) => {
+                println!("Error loading certificate from acme-lib persistence for domain {}: {}", domain, e);
+                Ok(None)
+            }
+        }
+    }
+
     /// Clean expired certificates from cache
     pub async fn clean_expired_certificates(&self) -> Result<usize, AcmeError> {
         let mut cache = self.certificate_cache.write().await;
@@ -700,137 +728,4 @@ impl AcmeClient {
         }
     }
 
-    /// Get the certificate storage directory path
-    fn get_certificate_dir(&self) -> Result<String, AcmeError> {
-        let base_dir = self.config.cache_dir.as_deref().unwrap_or("/tmp/acme_certs");
-        let env_suffix = if self.config.is_staging { "staging" } else { "production" };
-        let cert_dir = format!("{}/{}", base_dir, env_suffix);
-        
-        println!("🔄 Getting certificate directory: {}", cert_dir);
-        println!("   Base directory: {}", base_dir);
-        println!("   Environment suffix: {}", env_suffix);
-        
-        // Create directory if it doesn't exist
-        println!("🔄 Creating certificate directory if it doesn't exist: {}", cert_dir);
-        std::fs::create_dir_all(&cert_dir)
-            .map_err(|e| {
-                println!("❌ Failed to create certificate directory '{}': {}", cert_dir, e);
-                AcmeError::Client(format!("Failed to create certificate directory '{}': {}", cert_dir, e))
-            })?;
-        
-        println!("✅ Certificate directory ready: {}", cert_dir);
-        Ok(cert_dir)
-    }
-
-    /// Save certificate to disk
-    async fn save_certificate_to_disk(
-        &self,
-        domain: &str,
-        certified_key: &Arc<CertifiedKey>,
-        acme_cert: &acme_lib::Certificate,
-    ) -> Result<(), AcmeError> {
-        println!("🔄 Starting save_certificate_to_disk for domain: {}", domain);
-        let cert_dir = self.get_certificate_dir()?;
-        println!("✅ Certificate directory obtained: {}", cert_dir);
-        
-        // Save certificate chain
-        let cert_path = format!("{}/{}.crt", cert_dir, domain);
-        println!("🔄 Writing certificate file: {}", cert_path);
-        println!("   Certificate data length: {} bytes", acme_cert.certificate().len());
-        std::fs::write(&cert_path, acme_cert.certificate())
-            .map_err(|e| {
-                println!("❌ Failed to write certificate file '{}': {}", cert_path, e);
-                AcmeError::Client(format!("Failed to write certificate file '{}': {}", cert_path, e))
-            })?;
-        println!("✅ Certificate file written successfully: {}", cert_path);
-        
-        // Save private key
-        let key_path = format!("{}/{}.key", cert_dir, domain);
-        println!("🔄 Writing private key file: {}", key_path);
-        println!("   Private key data length: {} bytes", acme_cert.private_key().len());
-        std::fs::write(&key_path, acme_cert.private_key())
-            .map_err(|e| {
-                println!("❌ Failed to write private key file '{}': {}", key_path, e);
-                AcmeError::Client(format!("Failed to write private key file '{}': {}", key_path, e))
-            })?;
-        println!("✅ Private key file written successfully: {}", key_path);
-        
-        // Save metadata
-        let metadata_path = format!("{}/{}.meta", cert_dir, domain);
-        println!("🔄 Writing metadata file: {}", metadata_path);
-        let domain_email = self.get_email_for_domain(domain);
-        let metadata = serde_json::json!({
-            "domain": domain,
-            "email": domain_email,
-            "created_at": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
-            "is_staging": self.config.is_staging,
-            "acme_directory": self.config.directory_url,
-            "cert_path": cert_path,
-            "key_path": key_path
-        });
-        let metadata_str = metadata.to_string();
-        println!("   Metadata content length: {} bytes", metadata_str.len());
-        std::fs::write(&metadata_path, metadata_str)
-            .map_err(|e| {
-                println!("❌ Failed to write metadata file '{}': {}", metadata_path, e);
-                AcmeError::Client(format!("Failed to write metadata file '{}': {}", metadata_path, e))
-            })?;
-        println!("✅ Metadata file written successfully: {}", metadata_path);
-        
-        println!("✅ All files saved successfully for domain: {}", domain);
-        Ok(())
-    }
-
-    /// Load certificate from disk
-    async fn load_certificate_from_disk(&self, domain: &str) -> Result<Option<Arc<CertifiedKey>>, AcmeError> {
-        let cert_dir = self.get_certificate_dir()?;
-        let cert_path = format!("{}/{}.crt", cert_dir, domain);
-        let key_path = format!("{}/{}.key", cert_dir, domain);
-        let metadata_path = format!("{}/{}.meta", cert_dir, domain);
-        
-        // Check if all required files exist
-        if !std::path::Path::new(&cert_path).exists() ||
-           !std::path::Path::new(&key_path).exists() ||
-           !std::path::Path::new(&metadata_path).exists() {
-            return Ok(None);
-        }
-        
-        // Load and verify metadata
-        let metadata_content = std::fs::read_to_string(&metadata_path)
-            .map_err(|e| AcmeError::Client(format!("Failed to read metadata file '{}': {}", metadata_path, e)))?;
-        let metadata: serde_json::Value = serde_json::from_str(&metadata_content)
-            .map_err(|e| AcmeError::Serialization(format!("Failed to parse metadata file '{}': {}", metadata_path, e)))?;
-        
-        // Check if this is the right environment (staging vs production)
-        let is_staging = metadata.get("is_staging").and_then(|v| v.as_bool()).unwrap_or(false);
-        if is_staging != self.config.is_staging {
-            println!("Certificate environment mismatch for domain: {} (disk: {}, config: {})", 
-                     domain, if is_staging { "staging" } else { "production" }, 
-                     if self.config.is_staging { "staging" } else { "production" });
-            return Ok(None);
-        }
-        
-        // Load certificate and key
-        let cert_pem = std::fs::read_to_string(&cert_path)
-            .map_err(|e| AcmeError::Client(format!("Failed to read certificate file '{}': {}", cert_path, e)))?;
-        let key_pem = std::fs::read_to_string(&key_path)
-            .map_err(|e| AcmeError::Client(format!("Failed to read private key file '{}': {}", key_path, e)))?;
-        
-        // Convert to rustls format
-        let cert_chain = self.parse_pem_certificates(&cert_pem)?;
-        let private_key = self.parse_pem_private_key(&key_pem)?;
-        
-        // Create signing key
-        let provider = aws_lc_rs::default_provider();
-        let signing_key = provider
-            .key_provider
-            .load_private_key(private_key)
-            .map_err(|e| AcmeError::Client(format!("Failed to create signing key: {}", e)))?;
-        
-        let certified_key = CertifiedKey::new(cert_chain.into(), signing_key)
-            .map_err(|e| AcmeError::Certificate(e))?;
-        
-        println!("Loaded certificate from disk for domain: {}", domain);
-        Ok(Some(Arc::new(certified_key)))
-    }
 }

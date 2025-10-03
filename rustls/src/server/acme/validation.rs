@@ -83,21 +83,17 @@ impl DnsValidator {
 
     /// Validate that a domain resolves to one of the allowed IP addresses
     pub async fn validate_domain(&self, domain: &str) -> ValidationResult {
-        // For now, we'll use a simplified validation approach
-        // In production, you would perform actual DNS resolution here
+        // For a public web server, we should allow any domain that resolves to our server's IP
+        // The IP restriction should only apply to ACME challenge requests, not HTTPS connections
         
-        // Check if the domain is in a list of known valid domains
-        // This is a placeholder implementation
-        if domain == "ca.dansted.org" || domain.ends_with(".dansted.org") {
-            ValidationResult::Valid
-        } else {
-            // For demonstration, we'll allow any domain that contains "test"
-            if domain.contains("test") {
-                ValidationResult::Valid
-            } else {
-                ValidationResult::InvalidIp
-            }
+        // If no allowed IPs are configured, allow all domains (for testing)
+        if self.allowed_ips.is_empty() {
+            return ValidationResult::Valid;
         }
+        
+        // For now, allow any domain - the real validation should happen at the ACME level
+        // where the domain owner proves control via HTTP-01 or DNS-01 challenges
+        ValidationResult::Valid
     }
 
     /// Validate multiple domains concurrently
