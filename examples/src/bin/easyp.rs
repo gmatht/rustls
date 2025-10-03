@@ -177,6 +177,9 @@ impl OnDemandHttpsServer {
         let https_listener = TcpListener::bind(format!("0.0.0.0:{}", final_https_port))?;
         https_listener.set_nonblocking(true)?;
 
+        // Look up www-data UID/GID dynamically
+        let (www_data_uid, www_data_gid) = get_www_data_uid_gid()?;
+        
         // Create secure file server with security features
         let secure_file_server = SecureFileServer::new(SecurityConfig {
             document_root: PathBuf::from(&args.root),
@@ -205,8 +208,8 @@ impl OnDemandHttpsServer {
                 // System files
                 "htaccess".to_string(), "htpasswd".to_string(),
             ],
-            drop_to_uid: Some(65534), // nobody user
-            drop_to_gid: Some(65534), // nogroup
+            drop_to_uid: Some(www_data_uid),
+            drop_to_gid: Some(www_data_gid),
         });
 
                // Parse allowed IP addresses or auto-detect
@@ -223,8 +226,44 @@ impl OnDemandHttpsServer {
                // Create certificate resolver with real ACME integration
                #[cfg(feature = "acme")]
                let (cert_resolver, acme_client) = if args.test_mode {
-                   // In test mode, use a simple test resolver
-                   (Arc::new(TestCertResolver::new(allowed_ips.clone())?) as Arc<dyn ResolvesServerCert + Send + Sync>, None)
+                   // In test mode, use staging ACME servers for real certificates
+                   let directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory".to_string();
+                   
+                   // Determine email (prefer new --email over legacy --acme-email)
+                   let email = args.email.clone()
+                       .or(args.acme_email.clone())
+                       .unwrap_or_default();
+
+                   // Determine cache directory (prefer new --cache-dir over default)
+                   let cache_dir = if args.cache_dir != "/var/lib/easypeas/certs" {
+                       Some(args.cache_dir.clone())
+                   } else {
+                       None
+                   };
+
+                   let acme_config = AcmeConfig {
+                       directory_url,
+                       email,
+                       allowed_ips: allowed_ips.clone(),
+                       cache_dir,
+                       renewal_threshold_days: 30,
+                       challenge_type: ChallengeType::Http01,
+                       is_staging: true, // Always staging in test mode
+                   };
+
+                   let acme_client = AcmeClient::new(acme_config);
+                   let acme_client = Arc::new(acme_client);
+                   let dns_validator = Arc::new(DnsValidator::new(allowed_ips.clone())?);
+
+                   let cert_resolver = Arc::new(OnDemandCertResolver::new(
+                       acme_client.clone(),
+                       dns_validator,
+                       None, // No fallback resolver
+                       1000, // Max cache size
+                       Duration::from_secs(30 * 24 * 60 * 60), // 30 days renewal threshold
+                   )?);
+
+                   (cert_resolver as Arc<dyn ResolvesServerCert + Send + Sync>, Some(acme_client))
                } else {
                    // Determine ACME directory URL
                    let directory_url = if args.staging {
@@ -280,10 +319,31 @@ impl OnDemandHttpsServer {
                    (Arc::new(TestCertResolver::new(allowed_ips)?), None)
                };
 
+               // Ensure certificate cache directory has proper ownership before dropping privileges
+               if let Err(e) = ensure_cert_cache_permissions(&args.cache_dir, www_data_uid, www_data_gid) {
+                   println!("Warning: Failed to set certificate cache permissions: {}", e);
+                   // Continue anyway - this is not a fatal error
+               }
+               
                // Drop privileges to unprivileged user after binding to privileged ports
                if let Err(e) = secure_file_server.drop_privileges() {
                    println!("Warning: Failed to drop privileges: {}", e);
                    // Continue anyway - this is not a fatal error
+               } else {
+                   // Verify that privileges were dropped successfully
+                   match std::process::Command::new("whoami").output() {
+                       Ok(output) => {
+                           if output.status.success() {
+                               let username = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                               println!("Server now running as user: {}", username);
+                           } else {
+                               println!("Warning: Could not determine current user after privilege drop");
+                           }
+                       }
+                       Err(_) => {
+                           println!("Warning: Could not determine current user after privilege drop");
+                       }
+                   }
                }
 
                Ok(Self {
@@ -1175,7 +1235,7 @@ impl OnDemandHttpsServer {
                 return Some(response);
             }
         }
-
+        
         // Fallback to local storage
         if let Ok(challenges) = http_challenges.lock() {
             if let Some(response) = challenges.get(token) {
@@ -1221,43 +1281,85 @@ impl OnDemandHttpsServer {
     }
 }
 
-/// Test certificate resolver for demonstration purposes
-#[derive(Debug)]
-struct TestCertResolver {
-    allowed_ips: Vec<IpAddr>,
-    cert_cache: Arc<Mutex<HashMap<String, rustls::sign::CertifiedKey>>>,
-}
 
-impl TestCertResolver {
-    fn new(allowed_ips: Vec<IpAddr>) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            allowed_ips,
-            cert_cache: Arc::new(Mutex::new(HashMap::new())),
-        })
+/// Ensure certificate cache directory has proper ownership for www-data
+fn ensure_cert_cache_permissions(cache_dir: &str, uid: u32, gid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    
+    // Create the directory if it doesn't exist
+    let output = Command::new("mkdir")
+        .args(&["-p", cache_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to create certificate cache directory: {}", String::from_utf8_lossy(&output.stderr)).into());
     }
-
-}
-
-impl ResolvesServerCert for TestCertResolver {
-    fn resolve(&self, client_hello: &rustls::server::ClientHello<'_>) -> Result<rustls::sign::CertifiedSigner, rustls::Error> {
-        let Some(server_name) = client_hello.server_name() else {
-            return Err(rustls::Error::NoSuitableCertificate);
-        };
-
-        let domain = server_name.as_ref();
+    
+    // Create subdirectories that ACME client needs (based on environment)
+    let staging_dir = format!("{}/staging", cache_dir);
+    let production_dir = format!("{}/production", cache_dir);
+    
+    for dir in [&staging_dir, &production_dir] {
+        let output = Command::new("mkdir")
+            .args(&["-p", dir])
+            .output()?;
         
-        // Check cache first
-        if let Ok(cache) = self.cert_cache.lock() {
-            if let Some(certified_key) = cache.get(domain) {
-                return certified_key.signer(client_hello.signature_schemes())
-                    .ok_or(rustls::Error::NoSuitableCertificate);
-            }
+        if !output.status.success() {
+            return Err(format!("Failed to create certificate directory {}: {}", dir, String::from_utf8_lossy(&output.stderr)).into());
         }
-
-        // For now, just return an error to test HTTP functionality
-        println!("Certificate generation not implemented for domain: {}", domain);
-        Err(rustls::Error::NoSuitableCertificate)
     }
+    
+    // Set ownership to www-data recursively
+    let output = Command::new("chown")
+        .args(&["-R", &format!("{}:{}", uid, gid), cache_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to set ownership of certificate cache directory: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    
+    // Set permissions to 755 recursively
+    let output = Command::new("chmod")
+        .args(&["-R", "755", cache_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to set permissions of certificate cache directory: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    
+    println!("Certificate cache directory permissions set: {} (owner: {})", cache_dir, uid);
+    Ok(())
+}
+
+/// Look up the UID and GID for the www-data user
+fn get_www_data_uid_gid() -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    
+    // Try to get UID for www-data
+    let uid_output = Command::new("id")
+        .args(&["-u", "www-data"])
+        .output()?;
+    
+    if !uid_output.status.success() {
+        return Err("www-data user not found".into());
+    }
+    
+    let uid_str = String::from_utf8(uid_output.stdout)?;
+    let uid = uid_str.trim().parse::<u32>()?;
+    
+    // Try to get GID for www-data
+    let gid_output = Command::new("id")
+        .args(&["-g", "www-data"])
+        .output()?;
+    
+    if !gid_output.status.success() {
+        return Err("www-data group not found".into());
+    }
+    
+    let gid_str = String::from_utf8(gid_output.stdout)?;
+    let gid = gid_str.trim().parse::<u32>()?;
+    
+    Ok((uid, gid))
 }
 
 /// Automatically detect the server's IP addresses from network interfaces
