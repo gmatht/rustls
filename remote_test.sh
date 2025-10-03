@@ -40,7 +40,7 @@ then
 	rsync -avz target/debug/easyp root@$SRV: && echo "DEBUG: Binary sync completed"
 	
 	echo "DEBUG: Starting server in background..."
-	ssh root@$SRV "pkill easyp; chmod +x easyp; nohup ./easyp --root /var/www/html $VERBOSE $STAGING_FLAG $BOGUS > server.log 2>&1 &"
+	ssh root@$SRV "pkill easyp; chmod +x easyp; nohup ./easyp --root /var/www/html --staging $VERBOSE $STAGING_FLAG $BOGUS > server.log 2>&1 &"
 	echo "DEBUG: Server startup command sent to remote server"
 	
 	echo "DEBUG: Waiting 10 seconds for server to initialize..."

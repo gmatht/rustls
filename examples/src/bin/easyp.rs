@@ -115,6 +115,10 @@ struct Args {
     #[arg(long)]
     test_mode: bool,
 
+    /// Restore ACME certificates from backup before starting
+    #[arg(long)]
+    restore_backup: bool,
+
     /// Bogus domain to use for ACME requests (workaround for rate limits)
     #[arg(long)]
     bogus_domain: Option<String>,
@@ -299,6 +303,17 @@ impl OnDemandHttpsServer {
                    };
 
                    let acme_client = AcmeClient::new(acme_config);
+
+                   // Restore from backup if requested
+                   if args.restore_backup {
+                       println!("🔄 Restoring ACME certificates from backup...");
+                       let acme_persist_dir = format!("{}/acme_lib", args.cache_dir);
+                       if let Err(e) = acme_client.restore_acme_data(&acme_persist_dir) {
+                           println!("⚠️  Failed to restore from backup: {}", e);
+                       } else {
+                           println!("✅ ACME certificates restored from backup");
+                       }
+                   }
 
                    // Note: ACME account will be initialized per-domain when certificates are requested
 

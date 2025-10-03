@@ -148,6 +148,15 @@ impl AcmeClient {
         let cache_dir = self.config.cache_dir.as_deref()
             .ok_or_else(|| AcmeError::Client("ACME cache directory not configured".to_string()))?;
         let acme_persist_dir = format!("{}/acme_lib", cache_dir);
+        
+        // Backup existing data before any operations
+        if std::path::Path::new(&acme_persist_dir).exists() {
+            println!("💾 Backing up existing ACME data before account initialization...");
+            if let Err(e) = self.backup_acme_data(&acme_persist_dir) {
+                println!("⚠️  Backup failed, but continuing: {}", e);
+            }
+        }
+        
         std::fs::create_dir_all(&acme_persist_dir)
             .map_err(|e| AcmeError::Client(format!("Failed to create ACME persistence directory '{}': {}", acme_persist_dir, e)))?;
 
@@ -823,14 +832,168 @@ impl AcmeClient {
         Ok(initial_count - cache.len())
     }
 
+    /// Backup ACME certificates and account data to /root/.easyp_backup
+    fn backup_acme_data(&self, acme_persist_dir: &str) -> Result<(), AcmeError> {
+        use std::fs;
+        use std::path::Path;
+
+        let backup_dir = "/root/.easyp_backup";
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let backup_path = format!("{}/acme_backup_{}", backup_dir, timestamp);
+
+        println!("💾 Creating backup of ACME data to: {}", backup_path);
+
+        // Create backup directory
+        fs::create_dir_all(&backup_path)
+            .map_err(|e| AcmeError::Client(format!("Failed to create backup directory '{}': {}", backup_path, e)))?;
+
+        // Check if source directory exists
+        if !Path::new(acme_persist_dir).exists() {
+            println!("⚠️  Source ACME directory does not exist: {}", acme_persist_dir);
+            return Ok(());
+        }
+
+        // Copy all ACME data to backup
+        if let Err(e) = self.copy_directory_recursive(acme_persist_dir, &backup_path) {
+            return Err(AcmeError::Client(format!("Failed to backup ACME data: {}", e)));
+        }
+
+        // Set proper permissions on backup
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&backup_path)
+                .map_err(|e| AcmeError::Client(format!("Failed to get backup metadata: {}", e)))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&backup_path, perms)
+                .map_err(|e| AcmeError::Client(format!("Failed to set backup permissions: {}", e)))?;
+        }
+
+        println!("✅ ACME data backed up successfully to: {}", backup_path);
+        Ok(())
+    }
+
+    /// Restore ACME certificates and account data from the most recent backup
+    pub fn restore_acme_data(&self, acme_persist_dir: &str) -> Result<(), AcmeError> {
+        use std::fs;
+        use std::path::Path;
+
+        let backup_dir = "/root/.easyp_backup";
+        
+        println!("🔄 Attempting to restore ACME data from: {}", backup_dir);
+
+        // Check if backup directory exists
+        if !Path::new(backup_dir).exists() {
+            println!("⚠️  No backup directory found at: {}", backup_dir);
+            return Ok(());
+        }
+
+        // Find the most recent backup
+        let mut backup_dirs = Vec::new();
+        if let Ok(entries) = fs::read_dir(backup_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("acme_backup_") {
+                        if let Ok(metadata) = entry.metadata() {
+                            if let Ok(modified) = metadata.modified() {
+                                backup_dirs.push((name.to_string(), modified));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if backup_dirs.is_empty() {
+            println!("⚠️  No ACME backups found in: {}", backup_dir);
+            return Ok(());
+        }
+
+        // Sort by modification time (most recent first)
+        backup_dirs.sort_by(|a, b| b.1.cmp(&a.1));
+        let latest_backup = format!("{}/{}", backup_dir, backup_dirs[0].0);
+
+        println!("🔄 Restoring from latest backup: {}", latest_backup);
+
+        // Create target directory
+        fs::create_dir_all(acme_persist_dir)
+            .map_err(|e| AcmeError::Client(format!("Failed to create ACME directory '{}': {}", acme_persist_dir, e)))?;
+
+        // Copy backup to target
+        if let Err(e) = self.copy_directory_recursive(&latest_backup, acme_persist_dir) {
+            return Err(AcmeError::Client(format!("Failed to restore ACME data: {}", e)));
+        }
+
+        // Set proper permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(acme_persist_dir)
+                .map_err(|e| AcmeError::Client(format!("Failed to get metadata for directory: {}", e)))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(acme_persist_dir, perms)
+                .map_err(|e| AcmeError::Client(format!("Failed to set permissions: {}", e)))?;
+        }
+
+        println!("✅ ACME data restored successfully from: {}", latest_backup);
+        Ok(())
+    }
+
+    /// Helper function to copy directory recursively
+    fn copy_directory_recursive(&self, src: &str, dst: &str) -> Result<(), std::io::Error> {
+        use std::fs;
+        use std::path::Path;
+
+        let src_path = Path::new(src);
+        let dst_path = Path::new(dst);
+
+        if !src_path.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Source is not a directory",
+            ));
+        }
+
+        // Create destination directory
+        fs::create_dir_all(dst_path)?;
+
+        // Copy all entries
+        for entry in fs::read_dir(src_path)? {
+            let entry = entry?;
+            let src_file = entry.path();
+            let dst_file = dst_path.join(entry.file_name());
+
+            if src_file.is_dir() {
+                self.copy_directory_recursive(
+                    src_file.to_str().unwrap(),
+                    dst_file.to_str().unwrap(),
+                )?;
+            } else {
+                fs::copy(&src_file, &dst_file)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Clear old ACME account data when there's a private key format mismatch
     fn clear_old_account_data(&self, acme_persist_dir: &str) -> Result<(), AcmeError> {
         use std::fs;
         
         println!("🧹 Clearing old ACME account data from: {}", acme_persist_dir);
         
-        // Remove the entire acme-lib persistence directory
+        // ALWAYS backup before clearing!
         if std::path::Path::new(acme_persist_dir).exists() {
+            println!("💾 Backing up ACME data before clearing...");
+            if let Err(e) = self.backup_acme_data(acme_persist_dir) {
+                println!("⚠️  Backup failed, but continuing with clear: {}", e);
+            }
+            
             fs::remove_dir_all(acme_persist_dir)
                 .map_err(|e| AcmeError::Client(format!("Failed to remove old ACME data: {}", e)))?;
             println!("✅ Old ACME account data cleared successfully");
