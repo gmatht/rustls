@@ -117,7 +117,7 @@ impl OnDemandHttpsServer {
                    }).map_err(|e| format!("Failed to initialize ACME account: {}", e))?;
 
                    let acme_client = Arc::new(acme_client);
-                   let dns_validator = Arc::new(DnsValidator::new(allowed_ips)?);
+                   let dns_validator = Arc::new(DnsValidator::new(allowed_ips.clone())?);
 
                    let cert_resolver = Arc::new(OnDemandCertResolver::new(
                        acme_client.clone(),
