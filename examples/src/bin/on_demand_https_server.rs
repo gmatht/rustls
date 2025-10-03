@@ -89,14 +89,15 @@ impl OnDemandHttpsServer {
                // Create certificate resolver with real ACME integration
                #[cfg(feature = "acme")]
                let (cert_resolver, acme_client) = {
-                   let acme_config = AcmeConfig {
-                       directory_url: args.acme_directory.clone(),
-                       email: args.acme_email.clone(),
-                       allowed_ips: allowed_ips.clone(),
-                       cache_dir: args.cache_dir.clone(),
-                       renewal_threshold_days: 30,
-                       challenge_type: ChallengeType::Http01,
-                   };
+               let acme_config = AcmeConfig {
+                   directory_url: args.acme_directory.clone(),
+                   email: args.acme_email.clone(),
+                   allowed_ips: allowed_ips.clone(),
+                   cache_dir: args.cache_dir.clone(),
+                   renewal_threshold_days: 30,
+                   challenge_type: ChallengeType::Http01,
+                   is_staging: args.acme_directory.contains("staging") || args.acme_directory.contains("stg"),
+               };
 
                    let mut acme_client = AcmeClient::new(acme_config);
 

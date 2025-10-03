@@ -25,22 +25,24 @@ use {
     tokio::sync::RwLock,
 };
 
-/// Configuration for the ACME client
-#[derive(Debug, Clone)]
-pub struct AcmeConfig {
-    /// ACME directory URL (e.g., Let's Encrypt production or staging)
-    pub directory_url: String,
-    /// Email address for ACME account registration
-    pub email: String,
-    /// Allowed IP addresses for domain validation
-    pub allowed_ips: Vec<IpAddr>,
-    /// Challenge type preference (HTTP-01 or DNS-01)
-    pub challenge_type: ChallengeType,
-    /// Certificate cache directory
-    pub cache_dir: Option<String>,
-    /// Certificate validity threshold for renewal (days)
-    pub renewal_threshold_days: u32,
-}
+    /// Configuration for the ACME client
+    #[derive(Debug, Clone)]
+    pub struct AcmeConfig {
+        /// ACME directory URL (e.g., Let's Encrypt production or staging)
+        pub directory_url: String,
+        /// Email address for ACME account registration
+        pub email: String,
+        /// Allowed IP addresses for domain validation
+        pub allowed_ips: Vec<IpAddr>,
+        /// Challenge type preference (HTTP-01 or DNS-01)
+        pub challenge_type: ChallengeType,
+        /// Certificate cache directory
+        pub cache_dir: Option<String>,
+        /// Certificate validity threshold for renewal (days)
+        pub renewal_threshold_days: u32,
+        /// Whether this is a staging environment
+        pub is_staging: bool,
+    }
 
 impl Default for AcmeConfig {
     fn default() -> Self {
@@ -51,6 +53,7 @@ impl Default for AcmeConfig {
             challenge_type: ChallengeType::Http01,
             cache_dir: None,
             renewal_threshold_days: 30,
+            is_staging: false,
         }
     }
 }
@@ -196,6 +199,22 @@ impl AcmeClient {
             }
         }
 
+        // Try to load from disk
+        if let Some(certified_key) = self.load_certificate_from_disk(domain).await? {
+            // Cache the loaded certificate
+            {
+                let mut cache = self.certificate_cache.write().await;
+                let expires_at = SystemTime::now() + Duration::from_secs(60 * 60 * 24 * 30); // 30 days
+                cache.insert(domain.to_string(), CachedCertificate {
+                    certified_key: certified_key.clone(),
+                    expires_at,
+                    domain: domain.to_string(),
+                });
+            }
+            println!("Loaded certificate from disk for domain: {}", domain);
+            return Ok(certified_key);
+        }
+
         println!("Requesting ACME certificate for domain: {}", domain);
         println!("ACME Directory: {}", self.config.directory_url);
         println!("Challenge Type: {:?}", self.config.challenge_type);
@@ -315,7 +334,10 @@ impl AcmeClient {
             });
         }
 
-        println!("ACME certificate cached for domain: {}", domain);
+        // Save certificate to disk
+        self.save_certificate_to_disk(domain, &certified_key, &cert).await?;
+
+        println!("ACME certificate cached and saved to disk for domain: {}", domain);
         Ok(certified_key)
     }
 
@@ -480,5 +502,107 @@ impl AcmeClient {
         } else {
             Ok(None)
         }
+    }
+
+    /// Get the certificate storage directory path
+    fn get_certificate_dir(&self) -> Result<String, AcmeError> {
+        let base_dir = self.config.cache_dir.as_deref().unwrap_or("/tmp/acme_certs");
+        let env_suffix = if self.config.is_staging { "staging" } else { "production" };
+        let cert_dir = format!("{}/{}", base_dir, env_suffix);
+        
+        // Create directory if it doesn't exist
+        std::fs::create_dir_all(&cert_dir)
+            .map_err(|e| AcmeError::Io(e))?;
+            
+        Ok(cert_dir)
+    }
+
+    /// Save certificate to disk
+    async fn save_certificate_to_disk(
+        &self,
+        domain: &str,
+        certified_key: &Arc<CertifiedKey>,
+        acme_cert: &acme_lib::Certificate,
+    ) -> Result<(), AcmeError> {
+        let cert_dir = self.get_certificate_dir()?;
+        
+        // Save certificate chain
+        let cert_path = format!("{}/{}.crt", cert_dir, domain);
+        std::fs::write(&cert_path, acme_cert.certificate())
+            .map_err(|e| AcmeError::Io(e))?;
+        
+        // Save private key
+        let key_path = format!("{}/{}.key", cert_dir, domain);
+        std::fs::write(&key_path, acme_cert.private_key())
+            .map_err(|e| AcmeError::Io(e))?;
+        
+        // Save metadata
+        let metadata_path = format!("{}/{}.meta", cert_dir, domain);
+        let metadata = serde_json::json!({
+            "domain": domain,
+            "created_at": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+            "is_staging": self.config.is_staging,
+            "acme_directory": self.config.directory_url,
+            "cert_path": cert_path,
+            "key_path": key_path
+        });
+        std::fs::write(&metadata_path, metadata.to_string())
+            .map_err(|e| AcmeError::Io(e))?;
+        
+        println!("Certificate saved to disk: {}", cert_path);
+        Ok(())
+    }
+
+    /// Load certificate from disk
+    async fn load_certificate_from_disk(&self, domain: &str) -> Result<Option<Arc<CertifiedKey>>, AcmeError> {
+        let cert_dir = self.get_certificate_dir()?;
+        let cert_path = format!("{}/{}.crt", cert_dir, domain);
+        let key_path = format!("{}/{}.key", cert_dir, domain);
+        let metadata_path = format!("{}/{}.meta", cert_dir, domain);
+        
+        // Check if all required files exist
+        if !std::path::Path::new(&cert_path).exists() ||
+           !std::path::Path::new(&key_path).exists() ||
+           !std::path::Path::new(&metadata_path).exists() {
+            return Ok(None);
+        }
+        
+        // Load and verify metadata
+        let metadata_content = std::fs::read_to_string(&metadata_path)
+            .map_err(|e| AcmeError::Io(e))?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_content)
+            .map_err(|e| AcmeError::Serialization(e.to_string()))?;
+        
+        // Check if this is the right environment (staging vs production)
+        let is_staging = metadata.get("is_staging").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_staging != self.config.is_staging {
+            println!("Certificate environment mismatch for domain: {} (disk: {}, config: {})", 
+                     domain, if is_staging { "staging" } else { "production" }, 
+                     if self.config.is_staging { "staging" } else { "production" });
+            return Ok(None);
+        }
+        
+        // Load certificate and key
+        let cert_pem = std::fs::read_to_string(&cert_path)
+            .map_err(|e| AcmeError::Io(e))?;
+        let key_pem = std::fs::read_to_string(&key_path)
+            .map_err(|e| AcmeError::Io(e))?;
+        
+        // Convert to rustls format
+        let cert_chain = self.parse_pem_certificates(&cert_pem)?;
+        let private_key = self.parse_pem_private_key(&key_pem)?;
+        
+        // Create signing key
+        let provider = aws_lc_rs::default_provider();
+        let signing_key = provider
+            .key_provider
+            .load_private_key(private_key)
+            .map_err(|e| AcmeError::Client(format!("Failed to create signing key: {}", e)))?;
+        
+        let certified_key = CertifiedKey::new(cert_chain.into(), signing_key)
+            .map_err(|e| AcmeError::Certificate(e))?;
+        
+        println!("Loaded certificate from disk for domain: {}", domain);
+        Ok(Some(Arc::new(certified_key)))
     }
 }
