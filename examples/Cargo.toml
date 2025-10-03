@@ -11,6 +11,14 @@ publish = false
 name = "easyp"
 path = "src/bin/easyp.rs"
 
+[[bin]]
+name = "test_cert_storage_persistence"
+path = "../test_cert_storage_persistence.rs"
+
+[[bin]]
+name = "test_cert_storage_simple"
+path = "../test_cert_storage_simple.rs"
+
 [features]
 default = ["acme", "extensions"]
 acme = []
@@ -31,6 +39,8 @@ tokio = { workspace = true }
 webpki-roots = { workspace = true }
 time = { workspace = true }
 urlencoding = "2.1"
+tempfile = "3.8"
+serde_json = "1.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

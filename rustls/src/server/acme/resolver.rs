@@ -192,7 +192,25 @@ impl OnDemandCertResolver {
                     }
                     Err(e) => {
                         // Fall back to self-signed certificate if ACME fails
-                        println!("ACME certificate request failed for {}: {}, falling back to self-signed", domain, e);
+                        println!("ACME certificate request failed for {}: {}", domain, e);
+                        println!("Error details: {}", e);
+                        
+                        // Check for specific error types and provide helpful suggestions
+                        if let AcmeError::Client(msg) = &e {
+                            println!("ACME Client Error: {}", msg);
+                            if msg.contains("anti-replay nonce") || msg.contains("invalid nonce") {
+                                println!("🔧 Nonce Error Troubleshooting:");
+                                println!("   1. Check system clock synchronization: ntpdate -s time.nist.gov");
+                                println!("   2. Verify network connectivity to ACME server");
+                                println!("   3. Try using a different ACME directory URL");
+                                println!("   4. Wait a few minutes and retry");
+                            }
+                        } else if let AcmeError::Io(io_err) = &e {
+                            println!("IO Error: {}", io_err);
+                        } else if let AcmeError::Validation(msg) = &e {
+                            println!("Validation Error: {}", msg);
+                        }
+                        println!("Falling back to self-signed certificate for domain: {}", domain);
                         self.generate_self_signed_certificate(domain)
                     }
                 }

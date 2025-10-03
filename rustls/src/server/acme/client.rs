@@ -4,7 +4,7 @@
 //! certificates from Let's Encrypt and other ACME-compliant certificate authorities.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use std::string::String;
 use std::vec::Vec;
@@ -101,7 +101,7 @@ impl std::error::Error for AcmeError {}
 pub struct AcmeClient {
     config: AcmeConfig,
     certificate_cache: Arc<RwLock<HashMap<String, CachedCertificate>>>,
-    account: Option<acme_lib::Account<acme_lib::persist::MemoryPersist>>,
+    account: Arc<Mutex<Option<acme_lib::Account<acme_lib::persist::FilePersist>>>>,
     challenge_storage: Arc<RwLock<HashMap<String, ChallengeData>>>, // Added
 }
 
@@ -129,18 +129,35 @@ impl AcmeClient {
         Self {
             config,
             certificate_cache: Arc::new(RwLock::new(HashMap::new())),
-            account: None,
+            account: Arc::new(Mutex::new(None)),
             challenge_storage: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Initialize the ACME account (create or load existing)
-    pub async fn initialize_account(&mut self) -> Result<(), AcmeError> {
+    pub async fn initialize_account(&self) -> Result<(), AcmeError> {
         use acme_lib::{Directory, DirectoryUrl};
-        use acme_lib::persist::MemoryPersist;
+        use acme_lib::persist::FilePersist;
+
+        // Create a directory for acme-lib to store its files
+        let acme_persist_dir = format!("{}/acme_lib", self.config.cache_dir.as_deref().unwrap_or("/tmp/acme_certs"));
+        std::fs::create_dir_all(&acme_persist_dir)
+            .map_err(|e| AcmeError::Client(format!("Failed to create ACME persistence directory '{}': {}", acme_persist_dir, e)))?;
+
+        // Set proper permissions for the directory
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&acme_persist_dir)
+                .map_err(|e| AcmeError::Client(format!("Failed to get metadata for directory '{}': {}", acme_persist_dir, e)))?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&acme_persist_dir, perms)
+                .map_err(|e| AcmeError::Client(format!("Failed to set permissions for directory '{}': {}", acme_persist_dir, e)))?;
+        }
 
         // Create ACME directory
-        let persist = MemoryPersist::new();
+        let persist = FilePersist::new(&acme_persist_dir);
         let dir = Directory::from_url(persist, DirectoryUrl::Other(&self.config.directory_url))
             .map_err(|e| AcmeError::Client(format!("Failed to create ACME directory: {}", e)))?;
 
@@ -149,7 +166,8 @@ impl AcmeClient {
             .map_err(|e| AcmeError::Client(format!("Failed to create/load ACME account: {}", e)))?;
 
         // Store account for later use
-        self.account = Some(account);
+        let mut account_guard = self.account.lock().unwrap();
+        *account_guard = Some(account);
 
         Ok(())
     }
@@ -249,38 +267,137 @@ impl AcmeClient {
         Ok(certified_key)
     }
 
+    /// Retry ACME operation with exponential backoff for nonce errors
+    async fn retry_acme_operation<F, T>(&self, operation: F, max_retries: u32) -> Result<T, AcmeError>
+    where
+        F: Fn() -> Result<T, AcmeError>,
+    {
+        let mut retries = 0;
+        loop {
+            match operation() {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    let error_msg = format!("{}", e);
+                    if error_msg.contains("anti-replay nonce") || error_msg.contains("invalid nonce") {
+                        if retries < max_retries {
+                            retries += 1;
+                            let delay = Duration::from_millis((1000 * retries).into());
+                            println!("⚠️  Nonce error (attempt {}), retrying in {}ms...", retries, delay.as_millis());
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        } else {
+                            println!("❌ Max retries ({}) exceeded for nonce error", max_retries);
+                            return Err(e);
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     /// Request a real ACME certificate using HTTP-01 challenges
     pub async fn request_acme_certificate(&self, domain: &str) -> Result<Arc<CertifiedKey>, AcmeError> {
+        println!("🚀 Starting request_acme_certificate for domain: {}", domain);
+        
         // Check cache first
         {
             let cache = self.certificate_cache.read().await;
             if let Some(cached) = cache.get(domain) {
                 if cached.expires_at > SystemTime::now() {
+                    println!("✅ Found valid cached certificate for domain: {}", domain);
                     return Ok(cached.certified_key.clone());
                 }
             }
         }
+        println!("🔄 No valid cached certificate found, proceeding with ACME request");
 
         // Get domain-specific email
         let domain_email = self.get_email_for_domain(domain);
         println!("Using email for domain {}: {}", domain, domain_email);
 
-        // Create ACME directory and account for this domain
+        // Create a new ACME directory and account for this request
+        // This ensures proper nonce management per request
+        println!("Creating ACME directory for domain: {}", domain);
+        println!("ACME Directory URL: {}", self.config.directory_url);
+        
+        // Check system time for clock sync issues
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        println!("Current system time: {} seconds since epoch", now.as_secs());
+        println!("Current system time (human readable): {:?}", SystemTime::now());
+        
         use acme_lib::{Directory, DirectoryUrl};
-        use acme_lib::persist::MemoryPersist;
-
-        let persist = MemoryPersist::new();
+        use acme_lib::persist::FilePersist;
+        
+        // Create a directory for acme-lib to store its files
+        let acme_persist_dir = format!("{}/acme_lib", self.config.cache_dir.as_deref().unwrap_or("/tmp/acme_certs"));
+        std::fs::create_dir_all(&acme_persist_dir)
+            .map_err(|e| AcmeError::Client(format!("Failed to create ACME persistence directory '{}': {}", acme_persist_dir, e)))?;
+        
+        // Set proper permissions for the directory
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&acme_persist_dir)
+                .map_err(|e| AcmeError::Client(format!("Failed to get metadata for directory '{}': {}", acme_persist_dir, e)))?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&acme_persist_dir, perms)
+                .map_err(|e| AcmeError::Client(format!("Failed to set permissions for directory '{}': {}", acme_persist_dir, e)))?;
+        }
+        
+        println!("🔄 Using FilePersist for ACME in directory: {}", acme_persist_dir);
+        let persist = FilePersist::new(&acme_persist_dir);
         let dir = Directory::from_url(persist, DirectoryUrl::Other(&self.config.directory_url))
-            .map_err(|e| AcmeError::Client(format!("Failed to create ACME directory: {}", e)))?;
+            .map_err(|e| AcmeError::Client(format!("Failed to create ACME directory for domain '{}': {}", domain, e)))?;
 
-        let account = dir.account(&domain_email)
-            .map_err(|e| AcmeError::Client(format!("Failed to create/load ACME account for {}: {}", domain_email, e)))?;
+        // Create account with retry for nonce errors
+        println!("🔄 Creating ACME account for email: {}", domain_email);
+        let account = self.retry_acme_operation(|| {
+            dir.account(&domain_email)
+                .map_err(|e| {
+                    let error_msg = format!("Failed to create/load ACME account for {}: {}", domain_email, e);
+                    println!("❌ ACME account creation failed: {}", e);
+                    if error_msg.contains("anti-replay nonce") || error_msg.contains("invalid nonce") {
+                        println!("⚠️  Nonce error detected - this may be due to clock sync issues or network problems");
+                        println!("   Current time: {} seconds since epoch", now.as_secs());
+                        println!("   Consider checking system clock synchronization");
+                    } else if error_msg.contains("JWS verification error") || error_msg.contains("malformed") {
+                        println!("🔧 JWS Verification Error in account creation:");
+                        println!("   This indicates a problem with the JSON Web Signature");
+                        println!("   Possible causes:");
+                        println!("   1. Invalid or expired nonce");
+                        println!("   2. Clock synchronization issues");
+                        println!("   3. Invalid account key or signature");
+                        println!("   4. Malformed JWS structure");
+                        println!("   Error: {}", e);
+                    }
+                    AcmeError::Client(error_msg)
+                })
+        }, 3).await?;
+        println!("✅ ACME account created successfully for email: {}", domain_email);
 
         println!("Requesting real ACME certificate for domain: {}", domain);
 
         // Create order for the domain
+        println!("Creating ACME order for domain: {}", domain);
         let mut order = account.new_order(domain, &[])
-            .map_err(|e| AcmeError::Client(format!("Failed to create ACME order: {}", e)))?;
+            .map_err(|e| {
+                let error_msg = format!("Failed to create ACME order: {}", e);
+                println!("❌ ACME order creation failed: {}", e);
+                if error_msg.contains("anti-replay nonce") || error_msg.contains("invalid nonce") {
+                    println!("⚠️  Nonce error in order creation - retrying may help");
+                    println!("   Error: {}", e);
+                } else if error_msg.contains("Permission denied") || error_msg.contains("os error 13") {
+                    println!("🔧 Permission Error in ACME order creation:");
+                    println!("   This might be an issue with the ACME library's internal file operations");
+                    println!("   Error: {}", e);
+                }
+                AcmeError::Client(error_msg)
+            })?;
 
         println!("ACME order created for domain: {}", domain);
 
@@ -292,8 +409,27 @@ impl AcmeClient {
             }
 
             // Get authorizations
+            println!("Getting authorizations for domain: {}", domain);
             let auths = order.authorizations()
-                .map_err(|e| AcmeError::Client(format!("Failed to get authorizations: {}", e)))?;
+                .map_err(|e| {
+                    let error_msg = format!("Failed to get authorizations: {}", e);
+                    println!("❌ Failed to get authorizations: {}", e);
+                    if error_msg.contains("Permission denied") || error_msg.contains("os error 13") {
+                        println!("🔧 Permission Error in getting authorizations:");
+                        println!("   This might be an issue with the ACME library's internal file operations");
+                        println!("   Error: {}", e);
+                    } else if error_msg.contains("JWS verification error") || error_msg.contains("malformed") {
+                        println!("🔧 JWS Verification Error in getting authorizations:");
+                        println!("   This indicates a problem with the JSON Web Signature");
+                        println!("   Possible causes:");
+                        println!("   1. Invalid or expired nonce");
+                        println!("   2. Clock synchronization issues");
+                        println!("   3. Invalid account key or signature");
+                        println!("   4. Malformed JWS structure");
+                        println!("   Error: {}", e);
+                    }
+                    AcmeError::Client(error_msg)
+                })?;
 
             println!("Got {} authorizations for domain: {}", auths.len(), domain);
 
@@ -313,8 +449,18 @@ impl AcmeClient {
                 self.store_challenge(token.to_string(), proof.clone(), domain.to_string()).await?;
                 
                 // Trigger the challenge validation
+                println!("Triggering HTTP-01 challenge validation for domain: {}", domain);
                 challenge.validate(5000)
-                    .map_err(|e| AcmeError::Client(format!("HTTP-01 challenge validation failed: {}", e)))?;
+                    .map_err(|e| {
+                        let error_msg = format!("HTTP-01 challenge validation failed: {}", e);
+                        println!("❌ HTTP-01 challenge validation failed: {}", e);
+                        if error_msg.contains("Permission denied") || error_msg.contains("os error 13") {
+                            println!("🔧 Permission Error in challenge validation:");
+                            println!("   This might be an issue with the ACME library's internal file operations");
+                            println!("   Error: {}", e);
+                        }
+                        AcmeError::Client(error_msg)
+                    })?;
                 
                 println!("HTTP-01 challenge validation triggered for domain: {}", domain);
             }
@@ -336,16 +482,31 @@ impl AcmeClient {
         println!("Order finalized for domain: {}", domain);
 
         // Download the certificate
+        println!("Downloading certificate from ACME server for domain: {}", domain);
         let cert = order_cert.download_and_save_cert()
-            .map_err(|e| AcmeError::Client(format!("Failed to download certificate: {}", e)))?;
+            .map_err(|e| {
+                let error_msg = format!("Failed to download and save certificate for domain '{}': {}", domain, e);
+                println!("❌ Certificate download failed: {}", e);
+                if error_msg.contains("Permission denied") || error_msg.contains("os error 13") {
+                    println!("🔧 Permission Error in certificate download:");
+                    println!("   This might be an issue with the ACME library's internal file operations");
+                    println!("   The ACME library might be trying to write to a directory it doesn't have access to");
+                    println!("   Error: {}", e);
+                }
+                AcmeError::Client(error_msg)
+            })?;
 
-        println!("Certificate downloaded for domain: {}", domain);
+        println!("Certificate downloaded successfully for domain: {}", domain);
 
         // Convert the real ACME certificate to rustls format
         println!("Real ACME certificate obtained! Certificate chain length: {}", cert.certificate().len());
+        println!("🔄 Converting ACME certificate to rustls format for domain: {}", domain);
         let certified_key = self.convert_acme_cert_to_rustls(&cert)?;
+        println!("✅ Successfully converted ACME certificate to rustls format");
+        println!("🔄 About to start caching and saving process for domain: {}", domain);
 
         // Cache the certificate
+        println!("🔄 Caching certificate in memory for domain: {}", domain);
         {
             let mut cache = self.certificate_cache.write().await;
             let expires_at = SystemTime::now() + Duration::from_secs(60 * 60 * 24 * 30); // 30 days
@@ -355,9 +516,22 @@ impl AcmeClient {
                 domain: domain.to_string(),
             });
         }
+        println!("✅ ACME certificate cached in memory for domain: {}", domain);
 
         // Save certificate to disk
+        println!("🔄 Saving certificate to disk for domain: {}", domain);
+        
+        // Log current working directory and user info for debugging
+        if let Ok(current_dir) = std::env::current_dir() {
+            println!("   Current working directory: {}", current_dir.display());
+        }
+        if let Ok(user) = std::env::var("USER") {
+            println!("   Running as user: {}", user);
+        }
+        
+        println!("🔄 About to call save_certificate_to_disk for domain: {}", domain);
         self.save_certificate_to_disk(domain, &certified_key, &cert).await?;
+        println!("✅ Successfully saved certificate to disk for domain: {}", domain);
 
         println!("ACME certificate cached and saved to disk for domain: {}", domain);
         Ok(certified_key)
@@ -532,10 +706,19 @@ impl AcmeClient {
         let env_suffix = if self.config.is_staging { "staging" } else { "production" };
         let cert_dir = format!("{}/{}", base_dir, env_suffix);
         
+        println!("🔄 Getting certificate directory: {}", cert_dir);
+        println!("   Base directory: {}", base_dir);
+        println!("   Environment suffix: {}", env_suffix);
+        
         // Create directory if it doesn't exist
+        println!("🔄 Creating certificate directory if it doesn't exist: {}", cert_dir);
         std::fs::create_dir_all(&cert_dir)
-            .map_err(|e| AcmeError::Io(e))?;
-            
+            .map_err(|e| {
+                println!("❌ Failed to create certificate directory '{}': {}", cert_dir, e);
+                AcmeError::Client(format!("Failed to create certificate directory '{}': {}", cert_dir, e))
+            })?;
+        
+        println!("✅ Certificate directory ready: {}", cert_dir);
         Ok(cert_dir)
     }
 
@@ -546,20 +729,35 @@ impl AcmeClient {
         certified_key: &Arc<CertifiedKey>,
         acme_cert: &acme_lib::Certificate,
     ) -> Result<(), AcmeError> {
+        println!("🔄 Starting save_certificate_to_disk for domain: {}", domain);
         let cert_dir = self.get_certificate_dir()?;
+        println!("✅ Certificate directory obtained: {}", cert_dir);
         
         // Save certificate chain
         let cert_path = format!("{}/{}.crt", cert_dir, domain);
+        println!("🔄 Writing certificate file: {}", cert_path);
+        println!("   Certificate data length: {} bytes", acme_cert.certificate().len());
         std::fs::write(&cert_path, acme_cert.certificate())
-            .map_err(|e| AcmeError::Io(e))?;
+            .map_err(|e| {
+                println!("❌ Failed to write certificate file '{}': {}", cert_path, e);
+                AcmeError::Client(format!("Failed to write certificate file '{}': {}", cert_path, e))
+            })?;
+        println!("✅ Certificate file written successfully: {}", cert_path);
         
         // Save private key
         let key_path = format!("{}/{}.key", cert_dir, domain);
+        println!("🔄 Writing private key file: {}", key_path);
+        println!("   Private key data length: {} bytes", acme_cert.private_key().len());
         std::fs::write(&key_path, acme_cert.private_key())
-            .map_err(|e| AcmeError::Io(e))?;
+            .map_err(|e| {
+                println!("❌ Failed to write private key file '{}': {}", key_path, e);
+                AcmeError::Client(format!("Failed to write private key file '{}': {}", key_path, e))
+            })?;
+        println!("✅ Private key file written successfully: {}", key_path);
         
         // Save metadata
         let metadata_path = format!("{}/{}.meta", cert_dir, domain);
+        println!("🔄 Writing metadata file: {}", metadata_path);
         let domain_email = self.get_email_for_domain(domain);
         let metadata = serde_json::json!({
             "domain": domain,
@@ -570,10 +768,16 @@ impl AcmeClient {
             "cert_path": cert_path,
             "key_path": key_path
         });
-        std::fs::write(&metadata_path, metadata.to_string())
-            .map_err(|e| AcmeError::Io(e))?;
+        let metadata_str = metadata.to_string();
+        println!("   Metadata content length: {} bytes", metadata_str.len());
+        std::fs::write(&metadata_path, metadata_str)
+            .map_err(|e| {
+                println!("❌ Failed to write metadata file '{}': {}", metadata_path, e);
+                AcmeError::Client(format!("Failed to write metadata file '{}': {}", metadata_path, e))
+            })?;
+        println!("✅ Metadata file written successfully: {}", metadata_path);
         
-        println!("Certificate saved to disk: {}", cert_path);
+        println!("✅ All files saved successfully for domain: {}", domain);
         Ok(())
     }
 
@@ -593,9 +797,9 @@ impl AcmeClient {
         
         // Load and verify metadata
         let metadata_content = std::fs::read_to_string(&metadata_path)
-            .map_err(|e| AcmeError::Io(e))?;
+            .map_err(|e| AcmeError::Client(format!("Failed to read metadata file '{}': {}", metadata_path, e)))?;
         let metadata: serde_json::Value = serde_json::from_str(&metadata_content)
-            .map_err(|e| AcmeError::Serialization(e.to_string()))?;
+            .map_err(|e| AcmeError::Serialization(format!("Failed to parse metadata file '{}': {}", metadata_path, e)))?;
         
         // Check if this is the right environment (staging vs production)
         let is_staging = metadata.get("is_staging").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -608,9 +812,9 @@ impl AcmeClient {
         
         // Load certificate and key
         let cert_pem = std::fs::read_to_string(&cert_path)
-            .map_err(|e| AcmeError::Io(e))?;
+            .map_err(|e| AcmeError::Client(format!("Failed to read certificate file '{}': {}", cert_path, e)))?;
         let key_pem = std::fs::read_to_string(&key_path)
-            .map_err(|e| AcmeError::Io(e))?;
+            .map_err(|e| AcmeError::Client(format!("Failed to read private key file '{}': {}", key_path, e)))?;
         
         // Convert to rustls format
         let cert_chain = self.parse_pem_certificates(&cert_pem)?;
