@@ -42,6 +42,8 @@ use {
         pub renewal_threshold_days: u32,
         /// Whether this is a staging environment
         pub is_staging: bool,
+        /// Bogus domain to use for ACME requests (workaround for rate limits)
+        pub bogus_domain: Option<String>,
     }
 
 impl Default for AcmeConfig {
@@ -54,6 +56,7 @@ impl Default for AcmeConfig {
             cache_dir: None,
             renewal_threshold_days: 30,
             is_staging: false,
+            bogus_domain: None,
         }
     }
 }
@@ -140,7 +143,9 @@ impl AcmeClient {
         use acme_lib::persist::FilePersist;
 
         // Create a directory for acme-lib to store its files
-        let acme_persist_dir = format!("{}/acme_lib", self.config.cache_dir.as_deref().unwrap_or("/tmp/acme_certs"));
+        let cache_dir = self.config.cache_dir.as_deref()
+            .ok_or_else(|| AcmeError::Client("ACME cache directory not configured".to_string()))?;
+        let acme_persist_dir = format!("{}/acme_lib", cache_dir);
         std::fs::create_dir_all(&acme_persist_dir)
             .map_err(|e| AcmeError::Client(format!("Failed to create ACME persistence directory '{}': {}", acme_persist_dir, e)))?;
 
@@ -214,6 +219,105 @@ impl AcmeClient {
         storage.retain(|_, data| now.duration_since(data.created_at).unwrap_or(Duration::ZERO) < expired_threshold);
         
         Ok(initial_count - storage.len())
+    }
+
+    /// Log domain request for rate limit tracking
+    async fn log_domain_request(&self, domain: &str, is_production: bool, bogus_domain: Option<&str>) {
+        use std::path::PathBuf;
+        use std::fs;
+        
+        let cache_dir = match self.config.cache_dir.as_deref() {
+            Some(dir) => dir,
+            None => {
+                println!("Warning: ACME cache directory not configured, skipping domain logging");
+                return;
+            }
+        };
+        let log_file = PathBuf::from(cache_dir).join("domain_requests.json");
+        
+        // Load existing requests
+        let mut requests: Vec<serde_json::Value> = if log_file.exists() {
+            match fs::read_to_string(&log_file) {
+                Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        
+        // Check if this is a new production certificate for a previously logged domain
+        if is_production {
+            for existing in &requests {
+                if let (Some(existing_domain), Some(existing_production)) = 
+                    (existing.get("domain").and_then(|v| v.as_str()),
+                     existing.get("is_production").and_then(|v| v.as_bool())) {
+                    if existing_domain == domain && !existing_production {
+                        println!("⚠️  WARNING: PRODUCTION CERTIFICATE REQUESTED FOR PREVIOUSLY LOGGED DOMAIN!");
+                        println!("   Domain: {}", domain);
+                        println!("   Previous request was non-production at: {:?}", existing.get("timestamp"));
+                        println!("   This may indicate rate limit workaround usage!");
+                        println!("   ⚠️  WARNING: PRODUCTION CERTIFICATE REQUESTED FOR PREVIOUSLY LOGGED DOMAIN! ⚠️");
+                    }
+                }
+            }
+        }
+        
+        // Add new request
+        let new_request = serde_json::json!({
+            "domain": domain,
+            "timestamp": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            "is_production": is_production,
+            "bogus_domain": bogus_domain
+        });
+        requests.push(new_request);
+        
+        // Save updated requests
+        if let Ok(content) = serde_json::to_string_pretty(&requests) {
+            let _ = fs::write(&log_file, content);
+        }
+    }
+
+    /// Backup certificates from /tmp/acme_certs to appropriate backup directory
+    fn backup_acme_certificates(&self) {
+        use std::process::Command;
+        
+        let tmp_acme_dir = "/tmp/acme_certs";
+        let cache_dir = match self.config.cache_dir.as_deref() {
+            Some(dir) => dir,
+            None => {
+                println!("Warning: ACME cache directory not configured, skipping certificate backup");
+                return;
+            }
+        };
+        let backup_dir = if self.config.is_staging {
+            format!("{}/staging", cache_dir)
+        } else {
+            format!("{}/production", cache_dir)
+        };
+        
+        // Create backup directory
+        if let Err(e) = std::fs::create_dir_all(&backup_dir) {
+            println!("Warning: Failed to create backup directory {}: {}", backup_dir, e);
+            return;
+        }
+        
+        // Copy certificates from /tmp/acme_certs to backup directory
+        let output = Command::new("cp")
+            .args(&["-r", tmp_acme_dir, &backup_dir])
+            .output();
+        
+        match output {
+            Ok(output) => {
+                if output.status.success() {
+                    println!("Backed up ACME certificates from {} to {}", tmp_acme_dir, backup_dir);
+                } else {
+                    println!("Warning: Failed to backup ACME certificates: {}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+            Err(e) => {
+                println!("Warning: Failed to execute backup command: {}", e);
+            }
+        }
     }
 
     /// Get or create a certificate for the given domain
@@ -299,7 +403,18 @@ impl AcmeClient {
 
     /// Request a real ACME certificate using HTTP-01 challenges
     pub async fn request_acme_certificate(&self, domain: &str) -> Result<Arc<CertifiedKey>, AcmeError> {
-        println!("🚀 Starting request_acme_certificate for domain: {}", domain);
+        // Use bogus domain if specified (rate limit workaround)
+        let acme_domain = if let Some(ref bogus) = self.config.bogus_domain {
+            println!("🚀 Using bogus domain '{}' for ACME request (original domain: {})", bogus, domain);
+            bogus.as_str()
+        } else {
+            domain
+        };
+        
+        println!("🚀 Starting request_acme_certificate for domain: {} (ACME domain: {})", domain, acme_domain);
+        
+        // Log domain request for rate limit tracking
+        self.log_domain_request(domain, !self.config.is_staging, self.config.bogus_domain.as_deref()).await;
         
         // Check cache first
         {
@@ -314,12 +429,12 @@ impl AcmeClient {
         println!("🔄 No valid cached certificate found, proceeding with ACME request");
 
         // Get domain-specific email
-        let domain_email = self.get_email_for_domain(domain);
-        println!("Using email for domain {}: {}", domain, domain_email);
+        let domain_email = self.get_email_for_domain(acme_domain);
+        println!("Using email for domain {}: {}", acme_domain, domain_email);
 
         // Create a new ACME directory and account for this request
         // This ensures proper nonce management per request
-        println!("Creating ACME directory for domain: {}", domain);
+        println!("Creating ACME directory for domain: {} (ACME domain: {})", domain, acme_domain);
         println!("ACME Directory URL: {}", self.config.directory_url);
         
         // Check system time for clock sync issues
@@ -333,7 +448,9 @@ impl AcmeClient {
         use acme_lib::persist::FilePersist;
         
         // Create a directory for acme-lib to store its files
-        let acme_persist_dir = format!("{}/acme_lib", self.config.cache_dir.as_deref().unwrap_or("/tmp/acme_certs"));
+        let cache_dir = self.config.cache_dir.as_deref()
+            .ok_or_else(|| AcmeError::Client("ACME cache directory not configured".to_string()))?;
+        let acme_persist_dir = format!("{}/acme_lib", cache_dir);
         std::fs::create_dir_all(&acme_persist_dir)
             .map_err(|e| AcmeError::Client(format!("Failed to create ACME persistence directory '{}': {}", acme_persist_dir, e)))?;
         
@@ -384,7 +501,7 @@ impl AcmeClient {
 
         // Create order for the domain
         println!("Creating ACME order for domain: {}", domain);
-        let mut order = account.new_order(domain, &[])
+        let mut order = account.new_order(acme_domain, &[])
             .map_err(|e| {
                 let error_msg = format!("Failed to create ACME order: {}", e);
                 println!("❌ ACME order creation failed: {}", e);
@@ -540,6 +657,10 @@ impl AcmeClient {
             .map_err(|e| AcmeError::Certificate(e))?;
         
         println!("Successfully converted ACME certificate to rustls format");
+        
+        // Backup certificates from /tmp/acme_certs to appropriate backup directory
+        self.backup_acme_certificates();
+        
         Ok(Arc::new(certified_key))
     }
     
@@ -614,7 +735,9 @@ impl AcmeClient {
         use acme_lib::persist::FilePersist;
 
         // Create the same directory structure that acme-lib uses
-        let acme_persist_dir = format!("{}/acme_lib", self.config.cache_dir.as_deref().unwrap_or("/tmp/acme_certs"));
+        let cache_dir = self.config.cache_dir.as_deref()
+            .ok_or_else(|| AcmeError::Client("ACME cache directory not configured".to_string()))?;
+        let acme_persist_dir = format!("{}/acme_lib", cache_dir);
         
         // Check if the directory exists
         if !std::path::Path::new(&acme_persist_dir).exists() {

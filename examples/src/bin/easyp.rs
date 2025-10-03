@@ -115,12 +115,18 @@ struct Args {
     #[arg(long)]
     test_mode: bool,
 
+    /// Bogus domain to use for ACME requests (workaround for rate limits)
+    #[arg(long)]
+    bogus_domain: Option<String>,
+
     // Legacy compatibility arguments
     /// Port to listen on (legacy, use --https-port instead)
     #[arg(short, long, default_value = "443")]
     port: u16,
 
     /// ACME directory URL (legacy, use --staging instead)
+
+
 
     #[arg(long, default_value = "https://acme-v02.api.letsencrypt.org/directory")]
     acme_directory: String,
@@ -250,6 +256,7 @@ impl OnDemandHttpsServer {
                        renewal_threshold_days: 30,
                        challenge_type: ChallengeType::Http01,
                        is_staging: true, // Always staging in test mode
+                       bogus_domain: args.bogus_domain.clone(),
                    };
 
                    let acme_client = AcmeClient::new(acme_config);
@@ -294,6 +301,7 @@ impl OnDemandHttpsServer {
                        renewal_threshold_days: 30,
                        challenge_type: ChallengeType::Http01,
                        is_staging: args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg"),
+                       bogus_domain: args.bogus_domain.clone(),
                    };
 
                    let acme_client = AcmeClient::new(acme_config);
@@ -326,11 +334,29 @@ impl OnDemandHttpsServer {
                    // Continue anyway - this is not a fatal error
                }
                
+               // Restore ACME certificates from backup if /tmp/acme_certs is missing
+               let is_staging = args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg");
+               if let Err(e) = restore_acme_certificates(&args.cache_dir, is_staging) {
+                   println!("Warning: Failed to restore ACME certificates: {}", e);
+                   // Continue anyway - this is not a fatal error
+               }
+               
                // Ensure /tmp/acme_certs directory exists and is owned by www-data (acme-lib requirement)
                if let Err(e) = ensure_tmp_acme_permissions(www_data_uid, www_data_gid) {
                    println!("Warning: Failed to set /tmp/acme_certs permissions: {}", e);
                    // Continue anyway - this is not a fatal error
                }
+               
+               // Initialize domain request logger
+               let mut domain_logger = DomainRequestLogger::new(&args.cache_dir)
+                   .unwrap_or_else(|e| {
+                       println!("Warning: Failed to initialize domain logger: {}", e);
+                       // Create a dummy logger that does nothing
+                       DomainRequestLogger {
+                           log_file: std::path::PathBuf::new(),
+                           requests: Vec::new(),
+                       }
+                   });
                
                // Drop privileges to unprivileged user after binding to privileged ports
                if let Err(e) = secure_file_server.drop_privileges() {
@@ -1323,6 +1349,146 @@ fn ensure_tmp_acme_permissions(uid: u32, gid: u32) -> Result<(), Box<dyn std::er
     }
     
     println!("Certificate cache directory permissions set: {} (owner: {})", tmp_acme_dir, uid);
+    Ok(())
+}
+
+/// Domain request log entry
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DomainRequestLog {
+    domain: String,
+    timestamp: std::time::SystemTime,
+    is_production: bool,
+    bogus_domain: Option<String>,
+}
+
+/// Domain request logger
+struct DomainRequestLogger {
+    log_file: std::path::PathBuf,
+    requests: Vec<DomainRequestLog>,
+}
+
+impl DomainRequestLogger {
+    fn new(cache_dir: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let log_file = std::path::PathBuf::from(cache_dir).join("domain_requests.json");
+        let mut logger = Self {
+            log_file,
+            requests: Vec::new(),
+        };
+        logger.load()?;
+        Ok(logger)
+    }
+
+    fn load(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.log_file.exists() {
+            let content = std::fs::read_to_string(&self.log_file)?;
+            self.requests = serde_json::from_str(&content).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let content = serde_json::to_string_pretty(&self.requests)?;
+        std::fs::write(&self.log_file, content)?;
+        Ok(())
+    }
+
+    fn log_request(&mut self, domain: &str, is_production: bool, bogus_domain: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let entry = DomainRequestLog {
+            domain: domain.to_string(),
+            timestamp: std::time::SystemTime::now(),
+            is_production,
+            bogus_domain: bogus_domain.map(|s| s.to_string()),
+        };
+        
+        // Check if this is a new production certificate for a previously logged domain
+        if is_production {
+            for existing in &self.requests {
+                if existing.domain == domain && !existing.is_production {
+                    println!("⚠️  WARNING: PRODUCTION CERTIFICATE REQUESTED FOR PREVIOUSLY LOGGED DOMAIN!");
+                    println!("   Domain: {}", domain);
+                    println!("   Previous request was non-production at: {:?}", existing.timestamp);
+                    println!("   This may indicate rate limit workaround usage!");
+                    println!("   ⚠️  WARNING: PRODUCTION CERTIFICATE REQUESTED FOR PREVIOUSLY LOGGED DOMAIN! ⚠️");
+                }
+            }
+        }
+        
+        self.requests.push(entry);
+        self.save()?;
+        Ok(())
+    }
+
+    fn has_been_requested(&self, domain: &str) -> bool {
+        self.requests.iter().any(|r| r.domain == domain)
+    }
+}
+
+/// Backup certificates from /tmp/acme_certs to appropriate backup directory
+fn backup_acme_certificates(cache_dir: &str, is_staging: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    
+    let tmp_acme_dir = "/tmp/acme_certs";
+    let backup_dir = if is_staging {
+        format!("{}/staging", cache_dir)
+    } else {
+        format!("{}/production", cache_dir)
+    };
+    
+    // Create backup directory
+    std::fs::create_dir_all(&backup_dir)?;
+    
+    // Copy certificates from /tmp/acme_certs to backup directory
+    let output = Command::new("cp")
+        .args(&["-r", tmp_acme_dir, &backup_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to backup ACME certificates: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    
+    println!("Backed up ACME certificates from {} to {}", tmp_acme_dir, backup_dir);
+    Ok(())
+}
+
+/// Restore certificates from backup to /tmp/acme_certs if missing
+fn restore_acme_certificates(cache_dir: &str, is_staging: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    
+    let tmp_acme_dir = "/tmp/acme_certs";
+    let backup_dir = if is_staging {
+        format!("{}/staging/acme_certs", cache_dir)
+    } else {
+        format!("{}/production/acme_certs", cache_dir)
+    };
+    
+    // Check if /tmp/acme_certs exists and has content
+    if std::path::Path::new(tmp_acme_dir).exists() {
+        let entries = std::fs::read_dir(tmp_acme_dir)?;
+        if entries.count() > 0 {
+            println!("{} already exists with content, skipping restoration", tmp_acme_dir);
+            return Ok(());
+        }
+    }
+    
+    // Check if backup exists
+    if !std::path::Path::new(&backup_dir).exists() {
+        println!("No backup found at {}, skipping restoration", backup_dir);
+        return Ok(());
+    }
+    
+    // Create /tmp/acme_certs directory
+    std::fs::create_dir_all(tmp_acme_dir)?;
+    
+    // Copy certificates from backup to /tmp/acme_certs
+    let output = Command::new("cp")
+        .args(&["-r", &format!("{}/*", backup_dir), tmp_acme_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to restore ACME certificates: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    
+    println!("Restored ACME certificates from {} to {}", backup_dir, tmp_acme_dir);
     Ok(())
 }
 

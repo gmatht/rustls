@@ -191,27 +191,34 @@ impl OnDemandCertResolver {
                         Ok(certified_key)
                     }
                     Err(e) => {
-                        // Fall back to self-signed certificate if ACME fails
-                        println!("ACME certificate request failed for {}: {}", domain, e);
-                        println!("Error details: {}", e);
-                        
-                        // Check for specific error types and provide helpful suggestions
-                        if let AcmeError::Client(msg) = &e {
-                            println!("ACME Client Error: {}", msg);
-                            if msg.contains("anti-replay nonce") || msg.contains("invalid nonce") {
-                                println!("🔧 Nonce Error Troubleshooting:");
-                                println!("   1. Check system clock synchronization: ntpdate -s time.nist.gov");
-                                println!("   2. Verify network connectivity to ACME server");
-                                println!("   3. Try using a different ACME directory URL");
-                                println!("   4. Wait a few minutes and retry");
+                        // Check if this is a domain (has dots) - if so, don't allow self-signed fallback
+                        if domain.contains('.') {
+                            println!("ACME certificate request failed for domain {}: {}", domain, e);
+                            println!("Error details: {}", e);
+                            
+                            // Check for specific error types and provide helpful suggestions
+                            if let AcmeError::Client(msg) = &e {
+                                println!("ACME Client Error: {}", msg);
+                                if msg.contains("anti-replay nonce") || msg.contains("invalid nonce") {
+                                    println!("🔧 Nonce Error Troubleshooting:");
+                                    println!("   1. Check system clock synchronization: ntpdate -s time.nist.gov");
+                                    println!("   2. Verify network connectivity to ACME server");
+                                    println!("   3. Try using a different ACME directory URL");
+                                    println!("   4. Wait a few minutes and retry");
+                                }
+                            } else if let AcmeError::Io(io_err) = &e {
+                                println!("IO Error: {}", io_err);
+                            } else if let AcmeError::Validation(msg) = &e {
+                                println!("Validation Error: {}", msg);
                             }
-                        } else if let AcmeError::Io(io_err) = &e {
-                            println!("IO Error: {}", io_err);
-                        } else if let AcmeError::Validation(msg) = &e {
-                            println!("Validation Error: {}", msg);
+                            println!("❌ Self-signed certificates are not allowed for domains. ACME certificate required for: {}", domain);
+                            return Err(AcmeError::Validation(format!("ACME certificate required for domain: {}. Self-signed certificates are not allowed for domains.", domain)));
+                        } else {
+                            // Allow self-signed certificates for IP addresses and hostnames without dots
+                            println!("ACME certificate request failed for {}: {}", domain, e);
+                            println!("Falling back to self-signed certificate for: {}", domain);
+                            self.generate_self_signed_certificate(domain)
                         }
-                        println!("Falling back to self-signed certificate for domain: {}", domain);
-                        self.generate_self_signed_certificate(domain)
                     }
                 }
             }
@@ -338,12 +345,18 @@ impl ResolvesServerCert for OnDemandCertResolver {
                 match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt.handle().clone(),
                     Err(_) => {
-                        // Fallback to self-signed certificate
-                        println!("No tokio runtime available, generating self-signed certificate for: {}", domain);
-                        return self.generate_self_signed_certificate(domain)
-                            .and_then(|cert| cert.signer(client_hello.signature_schemes())
-                                .ok_or(AcmeError::Certificate(Error::NoSuitableCertificate)))
-                            .map_err(|e| Error::General(format!("Certificate generation failed: {}", e)));
+                        // Check if this is a domain (has dots) - if so, don't allow self-signed fallback
+                        if domain.contains('.') {
+                            println!("❌ No tokio runtime available and self-signed certificates are not allowed for domains: {}", domain);
+                            return Err(Error::General(format!("ACME certificate required for domain: {}. Self-signed certificates are not allowed for domains.", domain)));
+                        } else {
+                            // Allow self-signed certificates for IP addresses and hostnames without dots
+                            println!("No tokio runtime available, generating self-signed certificate for: {}", domain);
+                            return self.generate_self_signed_certificate(domain)
+                                .and_then(|cert| cert.signer(client_hello.signature_schemes())
+                                    .ok_or(AcmeError::Certificate(Error::NoSuitableCertificate)))
+                                .map_err(|e| Error::General(format!("Certificate generation failed: {}", e)));
+                        }
                     }
                 }
             }
@@ -362,12 +375,18 @@ impl ResolvesServerCert for OnDemandCertResolver {
                 if let Some(fallback) = &self.fallback_resolver {
                     fallback.resolve(client_hello)
                 } else {
-                    // Last resort: generate self-signed certificate
-                    println!("Generating self-signed certificate for domain: {}", domain);
-                    self.generate_self_signed_certificate(domain)
-                        .and_then(|cert| cert.signer(client_hello.signature_schemes())
-                            .ok_or(AcmeError::Certificate(Error::NoSuitableCertificate)))
-                        .map_err(|e| Error::General(format!("Certificate generation failed: {}", e)))
+                    // Check if this is a domain (has dots) - if so, don't allow self-signed fallback
+                    if domain.contains('.') {
+                        println!("❌ Self-signed certificates are not allowed for domains: {}", domain);
+                        Err(Error::General(format!("ACME certificate required for domain: {}. Self-signed certificates are not allowed for domains.", domain)))
+                    } else {
+                        // Allow self-signed certificates for IP addresses and hostnames without dots
+                        println!("Generating self-signed certificate for: {}", domain);
+                        self.generate_self_signed_certificate(domain)
+                            .and_then(|cert| cert.signer(client_hello.signature_schemes())
+                                .ok_or(AcmeError::Certificate(Error::NoSuitableCertificate)))
+                            .map_err(|e| Error::General(format!("Certificate generation failed: {}", e)))
+                    }
                 }
             }
         }
