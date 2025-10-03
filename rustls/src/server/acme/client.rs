@@ -157,7 +157,7 @@ impl AcmeClient {
     /// Get the email address for a specific domain
     fn get_email_for_domain(&self, domain: &str) -> String {
         // If a specific email is configured, use it
-        if !self.config.email.is_empty() && self.config.email != "admin@example.com" {
+        if !self.config.email.is_empty() {
             return self.config.email.clone();
         }
         

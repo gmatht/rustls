@@ -195,15 +195,10 @@ impl OnDemandHttpsServer {
                    };
 
                    // Determine email (prefer new --email over legacy --acme-email)
+                   // If no email is provided, the ACME client will generate webmaster@domain for each domain
                    let email = args.email.clone()
                        .or(args.acme_email.clone())
-                       .unwrap_or_else(|| {
-                           if args.test_mode {
-                               "test@localhost".to_string()
-                           } else {
-                               "admin@localhost".to_string()
-                           }
-                       });
+                       .unwrap_or_default();
 
                    // Determine cache directory (prefer new --cache-dir over default)
                    let cache_dir = if args.cache_dir != "/var/lib/easypeas/certs" {
@@ -222,13 +217,9 @@ impl OnDemandHttpsServer {
                        is_staging: args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg"),
                    };
 
-                   let mut acme_client = AcmeClient::new(acme_config);
+                   let acme_client = AcmeClient::new(acme_config);
 
-                   // Initialize ACME account
-                   let rt = tokio::runtime::Runtime::new().unwrap();
-                   rt.block_on(async {
-                       acme_client.initialize_account().await
-                   }).map_err(|e| format!("Failed to initialize ACME account: {}", e))?;
+                   // Note: ACME account will be initialized per-domain when certificates are requested
 
                    let acme_client = Arc::new(acme_client);
                    let dns_validator = Arc::new(DnsValidator::new(allowed_ips.clone())?);
