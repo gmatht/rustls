@@ -109,3 +109,13 @@ lto = true
 # against the latest _published_ copy.
 [patch.crates-io]
 rustls = { path = "rustls" }
+
+[profile.lto]
+opt-level = "z"
+strip = true
+lto = "fat"
+incremental = false
+overflow-checks = true
+debug = false
+codegen-units = 1
+inherits = "release"

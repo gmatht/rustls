@@ -1,10 +1,15 @@
 [package]
-name = "rustls-examples"
-version = "0.0.1"
+default-run = "easyp"
+name = "easyp"
+version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR ISC OR MIT"
-description = "Rustls example code and tests."
+description = "EasyPeas - On-demand HTTPS server with ACME certificate management"
 publish = false
+
+[[bin]]
+name = "easyp"
+path = "src/bin/easyp.rs"
 
 [features]
 acme = []
