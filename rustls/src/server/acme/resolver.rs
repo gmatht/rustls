@@ -291,6 +291,32 @@ impl OnDemandCertResolver {
         
         Ok(Arc::new(certified_key))
     }
+
+    /// Generate a self-signed certificate for IP address connections
+    fn generate_self_signed_certificate_for_ip(&self) -> Result<Arc<CertifiedKey>, Error> {
+        // Use rcgen's simple self-signed certificate generation
+        let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .map_err(|e| Error::General(format!("Failed to generate self-signed certificate: {}", e)))?;
+        
+        // Convert to rustls format
+        let cert_der = cert.der().clone();
+        let key_der = signing_key.serialize_der();
+        
+        let cert_chain = vec![pki_types::CertificateDer::from(cert_der)].into();
+        let key = pki_types::PrivateKeyDer::Pkcs8(key_der.into());
+        
+        // Create a simple signing key using the default provider
+        let provider = crate::crypto::aws_lc_rs::default_provider();
+        let signing_key = provider
+            .key_provider
+            .load_private_key(key)
+            .map_err(|e| Error::General(format!("Failed to create signing key: {}", e)))?;
+        
+        let certified_key = CertifiedKey::new(cert_chain, signing_key)
+            .map_err(|e| Error::General(format!("Failed to create certified key: {}", e)))?;
+        
+        Ok(Arc::new(certified_key))
+    }
 }
 
 impl std::fmt::Debug for OnDemandCertResolver {
@@ -305,11 +331,11 @@ impl std::fmt::Debug for OnDemandCertResolver {
 impl ResolvesServerCert for OnDemandCertResolver {
     fn resolve(&self, client_hello: &ClientHello<'_>) -> Result<CertifiedSigner, Error> {
         let Some(server_name) = client_hello.server_name() else {
-            // Try fallback resolver if no server name provided
-            if let Some(fallback) = &self.fallback_resolver {
-                return fallback.resolve(client_hello);
-            }
-            return Err(Error::NoSuitableCertificate);
+            // No server name provided (IP address connection) - generate self-signed certificate
+            println!("No server name provided (IP address connection), generating self-signed certificate");
+            return self.generate_self_signed_certificate_for_ip()
+                .and_then(|cert| cert.signer(client_hello.signature_schemes())
+                    .ok_or(Error::NoSuitableCertificate));
         };
 
         let domain = server_name.as_ref();
