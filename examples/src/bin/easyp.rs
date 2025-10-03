@@ -56,30 +56,50 @@ impl ExtensionRegistry {
 #[derive(Parser, Clone)]
 #[command(name = "easyp")]
 #[command(about = "EasyPeas - On-demand HTTPS server with ACME certificate management")]
+#[command(version)]
 struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value = "443")]
-    port: u16,
-
-    /// Allowed IP addresses for domain validation (comma-separated). If not specified, will auto-detect server IPs
+    /// Domains to serve (e.g., example.com, *.example.com)
+    domains: Vec<String>,
+    
+    /// HTTP port (default: 80)
+    #[arg(long, default_value = "80")]
+    http_port: u16,
+    
+    /// HTTPS port (default: 443)
+    #[arg(long, default_value = "443")]
+    https_port: u16,
+    
+    /// Email for ACME certificate registration (defaults to webmaster@domain for each domain)
+    #[arg(long)]
+    email: Option<String>,
+    
+    /// Use Let's Encrypt staging environment
+    #[arg(long)]
+    staging: bool,
+    
+    /// Add 9000 to default port numbers (HTTP: 9080, HTTPS: 9443)
+    #[arg(long)]
+    over_9000: bool,
+    
+    /// Test client binary to run when server is ready
+    #[arg(long)]
+    test_client: Option<String>,
+    
+    /// Test root directory for integration tests
+    #[arg(long, default_value = "test_root")]
+    test_root: String,
+    
+    /// Document root directory (default: /var/www/html)
+    #[arg(long, default_value = "/var/www/html")]
+    root: String,
+    
+    /// Allowed IP addresses for on-demand certificate requests (comma-separated). If not specified, will auto-detect server IPs
     #[arg(long)]
     allowed_ips: Option<String>,
-
-    /// ACME directory URL
-    #[arg(long, default_value = "https://acme-staging-v02.api.letsencrypt.org/directory")]
-    acme_directory: String,
-
-           /// Email address for ACME account (defaults to webmaster@domain for each domain)
-           #[arg(long)]
-           acme_email: Option<String>,
-
-    /// Challenge type (http01 or dns01)
-    #[arg(long, default_value = "http01")]
-    challenge_type: String,
-
-    /// Certificate cache directory
-    #[arg(long)]
-    cache_dir: Option<String>,
+    
+    /// Cache directory for ACME certificates (default: /var/lib/easypeas/certs)
+    #[arg(long, default_value = "/var/lib/easypeas/certs")]
+    cache_dir: String,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -88,6 +108,23 @@ struct Args {
     /// Test mode (use self-signed certificates)
     #[arg(long)]
     test_mode: bool,
+
+    // Legacy compatibility arguments
+    /// Port to listen on (legacy, use --https-port instead)
+    #[arg(short, long, default_value = "443")]
+    port: u16,
+
+    /// ACME directory URL (legacy, use --staging instead)
+    #[arg(long, default_value = "https://acme-staging-v02.api.letsencrypt.org/directory")]
+    acme_directory: String,
+
+    /// Email address for ACME account (legacy, use --email instead)
+    #[arg(long)]
+    acme_email: Option<String>,
+
+    /// Challenge type (http01 or dns01)
+    #[arg(long, default_value = "http01")]
+    challenge_type: String,
 }
 
 /// On-demand HTTPS server
@@ -105,12 +142,32 @@ struct OnDemandHttpsServer {
 impl OnDemandHttpsServer {
     /// Create a new on-demand HTTPS server
     fn new(args: Args) -> Result<Self, Box<dyn std::error::Error>> {
-        // Create HTTP listener on port 80 for ACME challenges
-        let http_listener = TcpListener::bind("0.0.0.0:80")?;
+        // Apply --over-9000 option to port numbers
+        let http_port = if args.over_9000 {
+            args.http_port + 9000
+        } else {
+            args.http_port
+        };
+        
+        let https_port = if args.over_9000 {
+            args.https_port + 9000
+        } else {
+            args.https_port
+        };
+
+        // Use legacy --port argument if provided (overrides --https-port)
+        let final_https_port = if args.port != 443 || args.over_9000 {
+            args.port
+        } else {
+            https_port
+        };
+
+        // Create HTTP listener on specified port for ACME challenges
+        let http_listener = TcpListener::bind(format!("0.0.0.0:{}", http_port))?;
         http_listener.set_nonblocking(true)?;
         
-        // Create HTTPS listener on port 443 for HTTPS traffic
-        let https_listener = TcpListener::bind("0.0.0.0:443")?;
+        // Create HTTPS listener on specified port for HTTPS traffic
+        let https_listener = TcpListener::bind(format!("0.0.0.0:{}", final_https_port))?;
         https_listener.set_nonblocking(true)?;
 
                // Parse allowed IP addresses or auto-detect
@@ -126,16 +183,44 @@ impl OnDemandHttpsServer {
 
                // Create certificate resolver with real ACME integration
                #[cfg(feature = "acme")]
-               let (cert_resolver, acme_client) = {
-               let acme_config = AcmeConfig {
-                   directory_url: args.acme_directory.clone(),
-                   email: args.acme_email.clone().unwrap_or_else(|| "admin@example.com".to_string()),
-                   allowed_ips: allowed_ips.clone(),
-                   cache_dir: args.cache_dir.clone(),
-                   renewal_threshold_days: 30,
-                   challenge_type: ChallengeType::Http01,
-                   is_staging: args.acme_directory.contains("staging") || args.acme_directory.contains("stg"),
-               };
+               let (cert_resolver, acme_client) = if args.test_mode {
+                   // In test mode, use a simple test resolver
+                   (Arc::new(TestCertResolver::new(allowed_ips.clone())?) as Arc<dyn ResolvesServerCert + Send + Sync>, None)
+               } else {
+                   // Determine ACME directory URL
+                   let directory_url = if args.staging {
+                       "https://acme-staging-v02.api.letsencrypt.org/directory".to_string()
+                   } else {
+                       args.acme_directory.clone()
+                   };
+
+                   // Determine email (prefer new --email over legacy --acme-email)
+                   let email = args.email.clone()
+                       .or(args.acme_email.clone())
+                       .unwrap_or_else(|| {
+                           if args.test_mode {
+                               "test@localhost".to_string()
+                           } else {
+                               "admin@localhost".to_string()
+                           }
+                       });
+
+                   // Determine cache directory (prefer new --cache-dir over default)
+                   let cache_dir = if args.cache_dir != "/var/lib/easypeas/certs" {
+                       Some(args.cache_dir.clone())
+                   } else {
+                       None
+                   };
+
+                   let acme_config = AcmeConfig {
+                       directory_url,
+                       email,
+                       allowed_ips: allowed_ips.clone(),
+                       cache_dir,
+                       renewal_threshold_days: 30,
+                       challenge_type: ChallengeType::Http01,
+                       is_staging: args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg"),
+                   };
 
                    let mut acme_client = AcmeClient::new(acme_config);
 
@@ -156,7 +241,7 @@ impl OnDemandHttpsServer {
                        Duration::from_secs(30 * 24 * 60 * 60), // 30 days renewal threshold
                    )?);
 
-                   (cert_resolver, Some(acme_client))
+                   (cert_resolver as Arc<dyn ResolvesServerCert + Send + Sync>, Some(acme_client))
                };
 
                #[cfg(not(feature = "acme"))]
@@ -179,13 +264,55 @@ impl OnDemandHttpsServer {
 
     /// Run the server
     fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-               println!("Starting EasyPeas on-demand HTTPS server");
-               println!("HTTP listener on port 80 (for ACME challenges)");
-               println!("HTTPS listener on port 443 (for HTTPS traffic)");
-               println!("Allowed IPs: {:?}", self.allowed_ips);
-               println!("ACME Directory: {}", self.args.acme_directory);
-               println!("Challenge Type: {}", self.args.challenge_type);
-               println!("Test Mode: {}", self.args.test_mode);
+        // Calculate actual ports (including --over-9000 effect)
+        let http_port = if self.args.over_9000 {
+            self.args.http_port + 9000
+        } else {
+            self.args.http_port
+        };
+        
+        let https_port = if self.args.over_9000 {
+            self.args.https_port + 9000
+        } else {
+            self.args.https_port
+        };
+
+        let final_https_port = if self.args.port != 443 || self.args.over_9000 {
+            self.args.port
+        } else {
+            https_port
+        };
+
+        println!("Starting EasyPeas on-demand HTTPS server");
+        println!("HTTP listener on port {} (for ACME challenges)", http_port);
+        println!("HTTPS listener on port {} (for HTTPS traffic)", final_https_port);
+        println!("Allowed IPs: {:?}", self.allowed_ips);
+        println!("ACME Directory: {}", if self.args.staging { "https://acme-staging-v02.api.letsencrypt.org/directory" } else { &self.args.acme_directory });
+        println!("Challenge Type: {}", self.args.challenge_type);
+        println!("Test Mode: {}", self.args.test_mode);
+        if !self.args.domains.is_empty() {
+            println!("Domains: {:?}", self.args.domains);
+        }
+        if let Some(ref email) = self.args.email.clone().or(self.args.acme_email.clone()) {
+            println!("Email: {}", email);
+        }
+        println!("Document Root: {}", self.args.root);
+        println!("Cache Directory: {}", self.args.cache_dir);
+
+        // Run test client if specified
+        if let Some(ref test_client) = self.args.test_client {
+            let test_client = test_client.clone();
+            println!("Running test client: {}", test_client);
+            std::thread::spawn(move || {
+                let output = std::process::Command::new(&test_client)
+                    .output()
+                    .expect("Failed to execute test client");
+                println!("Test client output: {}", String::from_utf8_lossy(&output.stdout));
+                if !output.stderr.is_empty() {
+                    eprintln!("Test client stderr: {}", String::from_utf8_lossy(&output.stderr));
+                }
+            });
+        }
 
         let mut connections: Vec<ServerConnection> = Vec::new();
 
