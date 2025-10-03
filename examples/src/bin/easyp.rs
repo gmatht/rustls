@@ -373,6 +373,7 @@ impl OnDemandHttpsServer {
                    }
                }
 
+
                Ok(Self {
                    http_listener,
                    https_listener,
@@ -1501,9 +1502,56 @@ fn ensure_acme_cache_directory(cache_dir: &str, uid: u32, gid: u32) -> Result<()
     Ok(())
 }
 
+/// Ensure www-data user exists, create if necessary
+fn ensure_www_data_user() -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    
+    // Check if www-data user exists
+    let check_output = Command::new("id")
+        .args(&["-u", "www-data"])
+        .output()?;
+    
+    if check_output.status.success() {
+        // User exists, nothing to do
+        return Ok(());
+    }
+    
+    println!("www-data user not found, creating...");
+    
+    // Create www-data group first
+    let group_output = Command::new("groupadd")
+        .args(&["www-data"])
+        .output()?;
+    
+    if !group_output.status.success() {
+        let stderr = String::from_utf8_lossy(&group_output.stderr);
+        if !stderr.contains("already exists") {
+            return Err(format!("Failed to create www-data group: {}", stderr).into());
+        }
+    }
+    
+    // Create www-data user
+    let user_output = Command::new("useradd")
+        .args(&["-r", "-g", "www-data", "-s", "/bin/false", "-d", "/var/www", "www-data"])
+        .output()?;
+    
+    if !user_output.status.success() {
+        let stderr = String::from_utf8_lossy(&user_output.stderr);
+        if !stderr.contains("already exists") {
+            return Err(format!("Failed to create www-data user: {}", stderr).into());
+        }
+    }
+    
+    println!("✅ www-data user created successfully");
+    Ok(())
+}
+
 /// Look up the UID and GID for the www-data user
 fn get_www_data_uid_gid() -> Result<(u32, u32), Box<dyn std::error::Error>> {
     use std::process::Command;
+    
+    // Ensure www-data user exists first
+    ensure_www_data_user()?;
     
     // Try to get UID for www-data
     let uid_output = Command::new("id")
@@ -1511,7 +1559,7 @@ fn get_www_data_uid_gid() -> Result<(u32, u32), Box<dyn std::error::Error>> {
         .output()?;
     
     if !uid_output.status.success() {
-        return Err("www-data user not found".into());
+        return Err("www-data user not found after creation attempt".into());
     }
     
     let uid_str = String::from_utf8(uid_output.stdout)?;
