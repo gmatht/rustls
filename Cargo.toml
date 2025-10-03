@@ -60,6 +60,7 @@ env_logger = "0.11"
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "inline-more"] }
 hex = "0.4"
 hickory-resolver = { version = "0.25", features = ["https-aws-lc-rs", "webpki-roots"] }
+get_if_addrs = "0.5"
 hmac = "0.12"
 thiserror = "1.0"
 hpke-rs = "0.3"

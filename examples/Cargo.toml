@@ -18,6 +18,7 @@ acme = []
 clap = { workspace = true }
 env_logger = { workspace = true }
 hickory-resolver = { workspace = true }
+get_if_addrs = { workspace = true }
 log = { workspace = true }
 mio = { workspace = true }
 rcgen = { workspace = true }
