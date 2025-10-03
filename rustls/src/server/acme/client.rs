@@ -364,9 +364,8 @@ impl AcmeClient {
         println!("ACME Directory: {}", self.config.directory_url);
         println!("Challenge Type: {:?}", self.config.challenge_type);
 
-        // For now, we'll generate a self-signed certificate as a fallback
-        // In production, this would use the full ACME protocol
-        let certified_key = self.generate_self_signed_certificate(domain)?;
+        // Request a real ACME certificate
+        let certified_key = self.request_acme_certificate(domain).await?;
 
         // Cache the certificate
         {

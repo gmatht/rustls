@@ -627,16 +627,34 @@ impl OnDemandHttpsServer {
                 }
             }
             Err(e) => {
-                // Security error or other error, send 403 or 404 for security
+                // Security error or other error - check if this is a root request first
                 println!("Request denied for {}: {}", request_path, e);
-                let response = "HTTP/1.1 404 Not Found\r\n\
-                               Content-Type: text/plain\r\n\
-                               Content-Length: 13\r\n\
-                               Connection: close\r\n\
-                               \r\n\
-                               Not Found";
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
+                if secure_file_server.is_root_request(request_path) {
+                    // Serve default informational page even for security errors on root
+                    let default_page = secure_file_server.generate_default_page("localhost");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {}",
+                        default_page.len(),
+                        default_page
+                    );
+                    stream.write_all(response.as_bytes())?;
+                    stream.flush()?;
+                } else {
+                    // Send 404 for non-root requests with security errors
+                    let response = "HTTP/1.1 404 Not Found\r\n\
+                                   Content-Type: text/plain\r\n\
+                                   Content-Length: 13\r\n\
+                                   Connection: close\r\n\
+                                   \r\n\
+                                   Not Found";
+                    stream.write_all(response.as_bytes())?;
+                    stream.flush()?;
+                }
             }
         }
 
@@ -702,7 +720,9 @@ impl OnDemandHttpsServer {
         };
 
         // Handle the connection
+        println!("🔍 About to call process_https_request_static for domain: {}", server_name);
         Self::process_https_request_static(&mut stream, &mut conn, &server_name, &acme_client, &http_challenges, &extension_registry, &secure_file_server)?;
+        println!("🔍 process_https_request_static completed for domain: {}", server_name);
 
         Ok(())
     }
@@ -781,35 +801,66 @@ impl OnDemandHttpsServer {
         extension_registry: &ExtensionRegistry,
         secure_file_server: &SecureFileServer,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🔍 process_https_request_static started for domain: {}", server_name);
         // Complete the handshake
+        println!("🔍 About to complete TLS handshake for domain: {}", server_name);
         conn.complete_io(stream)?;
+        println!("🔍 TLS handshake completed for domain: {}", server_name);
 
         // Read HTTP request using the TLS connection
         let mut buffer = [0; 4096];
         let mut total_read = 0;
 
+        println!("🔍 Starting to read HTTP request for domain: {}", server_name);
+        
+        // Complete any pending TLS I/O before reading
+        println!("🔍 Completing pending TLS I/O for domain: {}", server_name);
+        conn.complete_io(stream)?;
+        println!("🔍 TLS I/O completed for domain: {}", server_name);
+        
         // Read data in a loop to handle partial reads
+        let mut read_attempts = 0;
+        const MAX_READ_ATTEMPTS: usize = 1000; // 10 seconds with 10ms sleep
+        
         loop {
+            read_attempts += 1;
+            if read_attempts > MAX_READ_ATTEMPTS {
+                println!("🔍 Timeout waiting for HTTP request from domain: {}", server_name);
+                return Err("Timeout waiting for HTTP request".into());
+            }
+            
+            println!("🔍 Attempting to read data for domain: {} (total_read: {}, attempt: {})", server_name, total_read, read_attempts);
             match conn.reader().read(&mut buffer[total_read..]) {
-                Ok(0) => break, // Connection closed
+                Ok(0) => {
+                    println!("🔍 Connection closed for domain: {}", server_name);
+                    break; // Connection closed
+                }
                 Ok(n) => {
+                    println!("🔍 Read {} bytes for domain: {}", n, server_name);
                     total_read += n;
                     if total_read >= buffer.len() {
+                        println!("🔍 Buffer full for domain: {}", server_name);
                         break; // Buffer full
                     }
                     // Check if we have a complete HTTP request
                     if let Ok(request_str) = std::str::from_utf8(&buffer[..total_read]) {
+                        println!("🔍 Current request data for domain {}: {}", server_name, request_str);
                         if request_str.contains("\r\n\r\n") {
+                            println!("🔍 Complete HTTP request received for domain: {}", server_name);
                             break; // Complete HTTP request received
                         }
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    println!("🔍 WouldBlock error for domain: {}, waiting... (attempt {})", server_name, read_attempts);
                     // No data available, wait a bit
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    println!("🔍 Read error for domain {}: {}", server_name, e);
+                    return Err(e.into());
+                }
             }
         }
 
@@ -889,9 +940,29 @@ impl OnDemandHttpsServer {
                 }
             }
             Err(e) => {
-                // Security error or other error, send 403 or 404 for security
+                // Security error or other error - check if this is a root request first
                 println!("Request denied for {}: {}", request_path, e);
-                Self::send_error_response_static(conn, stream, 404, "Not Found")?;
+                if secure_file_server.is_root_request(request_path) {
+                    // Serve default informational page even for security errors on root
+                    let default_page = secure_file_server.generate_default_page(server_name);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {}",
+                        default_page.len(),
+                        default_page
+                    );
+
+                    conn.writer().write_all(response.as_bytes())?;
+                    conn.write_tls(stream)?;
+                    conn.complete_io(stream)?;
+                } else {
+                    // Send 404 for non-root requests with security errors
+                    Self::send_error_response_static(conn, stream, 404, "Not Found")?;
+                }
             }
         }
 
@@ -1620,6 +1691,7 @@ fn parse_allowed_ips(ips_str: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::E
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🚀 EasyPeas HTTPS Server starting - Debug version with enhanced ACME integration");
     let args = Args::parse();
 
     // Initialize logging
