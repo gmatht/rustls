@@ -359,12 +359,13 @@ impl OnDemandHttpsServer {
                 Ok((stream, addr)) => {
                     println!("New HTTP connection from {} (ACME challenge)", addr);
                     
-                    // Handle HTTP connection for ACME challenges
+                    // Handle HTTP connection for ACME challenges and file serving
                     let acme_client = self.acme_client.clone();
                     let http_challenges = self.http_challenges.clone();
+                    let secure_file_server = self.secure_file_server.clone();
 
                     std::thread::spawn(move || {
-                        if let Err(e) = Self::handle_http_connection(stream, acme_client, http_challenges) {
+                        if let Err(e) = Self::handle_http_connection(stream, acme_client, http_challenges, secure_file_server) {
                             eprintln!("HTTP connection error: {}", e);
                         }
                     });
@@ -390,11 +391,11 @@ impl OnDemandHttpsServer {
                     let extension_registry = self.extension_registry.clone();
                     let secure_file_server = self.secure_file_server.clone();
 
-                    std::thread::spawn(move || {
+                           std::thread::spawn(move || {
                         if let Err(e) = Self::handle_connection_static(stream, cert_resolver, args, acme_client, http_challenges, extension_registry, secure_file_server) {
-                            eprintln!("HTTPS connection error: {}", e);
-                        }
-                    });
+                                   eprintln!("HTTPS connection error: {}", e);
+                               }
+                           });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // No connection available, continue
@@ -416,11 +417,12 @@ impl OnDemandHttpsServer {
         }
     }
 
-    /// Handle HTTP connection (port 80) for ACME challenges
+    /// Handle HTTP connection (port 80) for ACME challenges and file serving
     fn handle_http_connection(
         mut stream: TcpStream,
         acme_client: Option<Arc<AcmeClient>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
+        secure_file_server: SecureFileServer,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Read HTTP request
         let mut buffer = [0; 4096];
@@ -464,16 +466,91 @@ impl OnDemandHttpsServer {
             }
         }
 
-        // Send 404 for non-ACME requests
+        // Extract the request path from the HTTP request
+        let request_path = if let Some(first_line) = lines.first() {
+            if let Some(path_start) = first_line.find(' ') {
+                if let Some(path_end) = first_line[path_start + 1..].find(' ') {
+                    &first_line[path_start + 1..path_start + 1 + path_end]
+                } else {
+                    "/"
+                }
+            } else {
+                "/"
+            }
+        } else {
+            "/"
+        };
+
+        println!("Requested path: {}", request_path);
+
+        // Try to serve the requested file using secure file server
+        match secure_file_server.serve_file(request_path) {
+            Ok(Some(file_content)) => {
+                // Successfully served a file
+                match secure_file_server.generate_http_response(request_path, file_content.as_slice()) {
+                    Ok(response_headers) => {
+                        let mut response = response_headers;
+                        response.push_str(&String::from_utf8_lossy(&file_content));
+
+                        stream.write_all(response.as_bytes())?;
+                        stream.flush()?;
+                    }
+                    Err(e) => {
+                        println!("Error generating HTTP response: {}", e);
+                        let error_response = "HTTP/1.1 500 Internal Server Error\r\n\
+                                             Content-Type: text/plain\r\n\
+                                             Content-Length: 21\r\n\
+                                             Connection: close\r\n\
+                                             \r\n\
+                                             Internal Server Error";
+                        stream.write_all(error_response.as_bytes())?;
+                        stream.flush()?;
+                    }
+                }
+            }
+            Ok(None) => {
+                // File not found - check if this is a root request (index.html missing)
+                if secure_file_server.is_root_request(request_path) {
+                    // Serve default informational page
+                    let default_page = secure_file_server.generate_default_page("localhost");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {}",
+                        default_page.len(),
+                        default_page
+                    );
+
+                    stream.write_all(response.as_bytes())?;
+                    stream.flush()?;
+                } else {
+                    // File not found, send 404 for non-root requests
         let response = "HTTP/1.1 404 Not Found\r\n\
                        Content-Type: text/plain\r\n\
                        Content-Length: 13\r\n\
                        Connection: close\r\n\
                        \r\n\
                        Not Found";
-
         stream.write_all(response.as_bytes())?;
         stream.flush()?;
+                }
+            }
+            Err(e) => {
+                // Security error or other error, send 403 or 404 for security
+                println!("Request denied for {}: {}", request_path, e);
+                let response = "HTTP/1.1 404 Not Found\r\n\
+                               Content-Type: text/plain\r\n\
+                               Content-Length: 13\r\n\
+                               Connection: close\r\n\
+                               \r\n\
+                               Not Found";
+                stream.write_all(response.as_bytes())?;
+                stream.flush()?;
+            }
+        }
 
         Ok(())
     }
@@ -663,12 +740,28 @@ impl OnDemandHttpsServer {
                    }
         }
 
+        // Extract the request path from the HTTP request
+        let request_path = if let Some(first_line) = lines.first() {
+            if let Some(path_start) = first_line.find(' ') {
+                if let Some(path_end) = first_line[path_start + 1..].find(' ') {
+                    &first_line[path_start + 1..path_start + 1 + path_end]
+                } else {
+                    "/"
+                }
+            } else {
+                "/"
+            }
+        } else {
+            "/"
+        };
+
+        println!("Requested path: {}", request_path);
+
         // Try to serve the requested file using secure file server
-        let request_path = "/"; // Default to root path
         match secure_file_server.serve_file(request_path) {
             Ok(Some(file_content)) => {
                 // Successfully served a file
-                match secure_file_server.generate_http_response(request_path, &file_content) {
+                match secure_file_server.generate_http_response(request_path, file_content.as_slice()) {
                     Ok(response_headers) => {
                         let mut response = response_headers;
                         response.push_str(&String::from_utf8_lossy(&file_content));
@@ -684,8 +777,28 @@ impl OnDemandHttpsServer {
                 }
             }
             Ok(None) => {
-                // File not found, send 404
-                Self::send_error_response_static(conn, stream, 404, "Not Found")?;
+                // File not found - check if this is a root request (index.html missing)
+                if secure_file_server.is_root_request(request_path) {
+                    // Serve default informational page
+                    let default_page = secure_file_server.generate_default_page(server_name);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {}",
+                        default_page.len(),
+                        default_page
+                    );
+
+                    conn.writer().write_all(response.as_bytes())?;
+                    conn.write_tls(stream)?;
+                    conn.complete_io(stream)?;
+                } else {
+                    // File not found, send 404 for non-root requests
+                    Self::send_error_response_static(conn, stream, 404, "Not Found")?;
+                }
             }
             Err(e) => {
                 // Security error or other error, send 403 or 404 for security
@@ -759,7 +872,7 @@ impl OnDemandHttpsServer {
         match self.secure_file_server.serve_file(request_path) {
             Ok(Some(file_content)) => {
                 // Successfully served a file
-                match self.secure_file_server.generate_http_response(request_path, &file_content) {
+                match self.secure_file_server.generate_http_response(request_path, file_content.as_slice()) {
                     Ok(response_headers) => {
                         let mut response = response_headers;
                         response.push_str(&String::from_utf8_lossy(&file_content));
@@ -1069,7 +1182,7 @@ impl OnDemandHttpsServer {
                 return Some(response.clone());
             }
         }
-
+        
         // Last resort: placeholder response
         if !token.is_empty() {
             Some(format!("challenge-response-for-{}", token))
@@ -1141,9 +1254,7 @@ impl ResolvesServerCert for TestCertResolver {
             }
         }
 
-        // For this demo, we'll just return an error since certificate generation
-        // requires more complex setup. In a real implementation, you'd use rcgen
-        // or another certificate generation library.
+        // For now, just return an error to test HTTP functionality
         println!("Certificate generation not implemented for domain: {}", domain);
         Err(rustls::Error::NoSuitableCertificate)
     }
