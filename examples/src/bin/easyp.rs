@@ -224,7 +224,8 @@ impl OnDemandHttpsServer {
                let allowed_ips = if let Some(ips_str) = &args.allowed_ips {
                    parse_allowed_ips(ips_str)?
                } else {
-                   println!("No allowed IPs specified, auto-detecting server IPs...");
+                   println!("[{}] No allowed IPs specified, auto-detecting server IPs...", 
+                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
                    detect_server_ips().unwrap_or_else(|e| {
                        println!("Warning: Could not detect server IPs ({}), using localhost fallback", e);
                        vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))]

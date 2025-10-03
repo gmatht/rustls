@@ -285,9 +285,13 @@ impl AcmeClient {
             let cache = self.certificate_cache.read().await;
             if let Some(cached) = cache.get(domain) {
                 if cached.expires_at > SystemTime::now() {
+                    println!("OLD CERT OK");
                     return Ok(cached.certified_key.clone());
                 }
-            }
+                println!("CERT EXPIRED");
+            } else {
+                println!("NO CERT IN CACHE!");
+            }   
         }
 
         // Try to load from acme-lib's persistence

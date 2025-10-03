@@ -176,8 +176,8 @@ impl OnDemandCertResolver {
         let validation_result = self.dns_validator.validate_domain(domain).await;
         match validation_result {
             ValidationResult::Valid => {
-                // Domain is authorized, try to get certificate from ACME
-                match self.acme_client.request_acme_certificate(domain).await {
+                // Domain is authorized, try to get certificate from ACME (this will check cache first)
+                match self.acme_client.get_certificate(domain).await {
                     Ok(certified_key) => {
                         // Cache the certificate
                         let expires_at = SystemTime::now() + Duration::from_secs(60 * 60 * 24 * 30); // 30 days
