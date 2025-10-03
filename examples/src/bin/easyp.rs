@@ -140,6 +140,7 @@ struct Args {
     challenge_type: String,
 }
 
+
 /// On-demand HTTPS server
 struct OnDemandHttpsServer {
     http_listener: TcpListener,  // Port 80 for ACME challenges
@@ -241,12 +242,8 @@ impl OnDemandHttpsServer {
                        .or(args.acme_email.clone())
                        .unwrap_or_default();
 
-                   // Determine cache directory (prefer new --cache-dir over default)
-                   let cache_dir = if args.cache_dir != "/var/lib/easypeas/certs" {
-                       Some(args.cache_dir.clone())
-                   } else {
-                       None
-                   };
+                   // Determine cache directory (always use the specified cache directory)
+                   let cache_dir = Some(args.cache_dir.clone());
 
                    let acme_config = AcmeConfig {
                        directory_url,
@@ -286,12 +283,8 @@ impl OnDemandHttpsServer {
                        .or(args.acme_email.clone())
                        .unwrap_or_default();
 
-                   // Determine cache directory (prefer new --cache-dir over default)
-                   let cache_dir = if args.cache_dir != "/var/lib/easypeas/certs" {
-                       Some(args.cache_dir.clone())
-                   } else {
-                       None
-                   };
+                   // Determine cache directory (always use the specified cache directory)
+                   let cache_dir = Some(args.cache_dir.clone());
 
                    let acme_config = AcmeConfig {
                        directory_url,
@@ -338,6 +331,13 @@ impl OnDemandHttpsServer {
                if let Err(e) = ensure_tmp_acme_permissions(www_data_uid, www_data_gid) {
                    println!("Warning: Failed to set /tmp/acme_certs permissions: {}", e);
                    // Continue anyway - this is not a fatal error
+               }
+               
+               // Ensure ACME cache directory is properly configured and accessible
+               println!("ACME cache directory: {}", args.cache_dir);
+               if let Err(e) = ensure_acme_cache_directory(&args.cache_dir, www_data_uid, www_data_gid) {
+                   println!("Error: Failed to set up ACME cache directory: {}", e);
+                   return Err(format!("ACME cache directory setup failed: {}", e).into());
                }
                
                // Initialize domain request logger
@@ -1463,6 +1463,40 @@ fn ensure_cert_cache_permissions(cache_dir: &str, uid: u32, gid: u32) -> Result<
     }
     
     println!("Certificate cache directory permissions set: {} (owner: {})", cache_dir, uid);
+    Ok(())
+}
+
+/// Ensure ACME cache directory is properly set up with www-data permissions
+fn ensure_acme_cache_directory(cache_dir: &str, uid: u32, gid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    
+    // Create the main cache directory
+    std::fs::create_dir_all(cache_dir)?;
+    
+    // Create the acme_lib subdirectory
+    let acme_lib_dir = format!("{}/acme_lib", cache_dir);
+    std::fs::create_dir_all(&acme_lib_dir)?;
+    
+    // Set ownership to www-data for both directories
+    let output = Command::new("chown")
+        .args(&["-R", &format!("{}:{}", uid, gid), cache_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to set ownership of ACME cache directory '{}': {}", cache_dir, String::from_utf8_lossy(&output.stderr)).into());
+    }
+    
+    // Set permissions to 755 for both directories
+    let output = Command::new("chmod")
+        .args(&["-R", "755", cache_dir])
+        .output()?;
+    
+    if !output.status.success() {
+        return Err(format!("Failed to set permissions of ACME cache directory '{}': {}", cache_dir, String::from_utf8_lossy(&output.stderr)).into());
+    }
+    
+    println!("ACME cache directory permissions set: {} (owner: {})", cache_dir, uid);
+    println!("ACME lib directory created: {}", acme_lib_dir);
     Ok(())
 }
 
