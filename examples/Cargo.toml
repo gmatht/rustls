@@ -12,6 +12,7 @@ name = "easyp"
 path = "src/bin/easyp.rs"
 
 [features]
+default = ["acme", "extensions"]
 acme = []
 extensions = []
 
