@@ -334,13 +334,6 @@ impl OnDemandHttpsServer {
                    // Continue anyway - this is not a fatal error
                }
                
-               // Restore ACME certificates from backup if /tmp/acme_certs is missing
-               let is_staging = args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg");
-               if let Err(e) = restore_acme_certificates(&args.cache_dir, is_staging) {
-                   println!("Warning: Failed to restore ACME certificates: {}", e);
-                   // Continue anyway - this is not a fatal error
-               }
-               
                // Ensure /tmp/acme_certs directory exists and is owned by www-data (acme-lib requirement)
                if let Err(e) = ensure_tmp_acme_permissions(www_data_uid, www_data_gid) {
                    println!("Warning: Failed to set /tmp/acme_certs permissions: {}", e);
@@ -1423,74 +1416,6 @@ impl DomainRequestLogger {
     }
 }
 
-/// Backup certificates from /tmp/acme_certs to appropriate backup directory
-fn backup_acme_certificates(cache_dir: &str, is_staging: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-    
-    let tmp_acme_dir = "/tmp/acme_certs";
-    let backup_dir = if is_staging {
-        format!("{}/staging", cache_dir)
-    } else {
-        format!("{}/production", cache_dir)
-    };
-    
-    // Create backup directory
-    std::fs::create_dir_all(&backup_dir)?;
-    
-    // Copy certificates from /tmp/acme_certs to backup directory
-    let output = Command::new("cp")
-        .args(&["-r", tmp_acme_dir, &backup_dir])
-        .output()?;
-    
-    if !output.status.success() {
-        return Err(format!("Failed to backup ACME certificates: {}", String::from_utf8_lossy(&output.stderr)).into());
-    }
-    
-    println!("Backed up ACME certificates from {} to {}", tmp_acme_dir, backup_dir);
-    Ok(())
-}
-
-/// Restore certificates from backup to /tmp/acme_certs if missing
-fn restore_acme_certificates(cache_dir: &str, is_staging: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-    
-    let tmp_acme_dir = "/tmp/acme_certs";
-    let backup_dir = if is_staging {
-        format!("{}/staging/acme_certs", cache_dir)
-    } else {
-        format!("{}/production/acme_certs", cache_dir)
-    };
-    
-    // Check if /tmp/acme_certs exists and has content
-    if std::path::Path::new(tmp_acme_dir).exists() {
-        let entries = std::fs::read_dir(tmp_acme_dir)?;
-        if entries.count() > 0 {
-            println!("{} already exists with content, skipping restoration", tmp_acme_dir);
-            return Ok(());
-        }
-    }
-    
-    // Check if backup exists
-    if !std::path::Path::new(&backup_dir).exists() {
-        println!("No backup found at {}, skipping restoration", backup_dir);
-        return Ok(());
-    }
-    
-    // Create /tmp/acme_certs directory
-    std::fs::create_dir_all(tmp_acme_dir)?;
-    
-    // Copy certificates from backup to /tmp/acme_certs
-    let output = Command::new("cp")
-        .args(&["-r", &format!("{}/*", backup_dir), tmp_acme_dir])
-        .output()?;
-    
-    if !output.status.success() {
-        return Err(format!("Failed to restore ACME certificates: {}", String::from_utf8_lossy(&output.stderr)).into());
-    }
-    
-    println!("Restored ACME certificates from {} to {}", backup_dir, tmp_acme_dir);
-    Ok(())
-}
 
 /// Ensure certificate cache directory has proper ownership for www-data
 fn ensure_cert_cache_permissions(cache_dir: &str, uid: u32, gid: u32) -> Result<(), Box<dyn std::error::Error>> {

@@ -277,48 +277,6 @@ impl AcmeClient {
         }
     }
 
-    /// Backup certificates from /tmp/acme_certs to appropriate backup directory
-    fn backup_acme_certificates(&self) {
-        use std::process::Command;
-        
-        let tmp_acme_dir = "/tmp/acme_certs";
-        let cache_dir = match self.config.cache_dir.as_deref() {
-            Some(dir) => dir,
-            None => {
-                println!("Warning: ACME cache directory not configured, skipping certificate backup");
-                return;
-            }
-        };
-        let backup_dir = if self.config.is_staging {
-            format!("{}/staging", cache_dir)
-        } else {
-            format!("{}/production", cache_dir)
-        };
-        
-        // Create backup directory
-        if let Err(e) = std::fs::create_dir_all(&backup_dir) {
-            println!("Warning: Failed to create backup directory {}: {}", backup_dir, e);
-            return;
-        }
-        
-        // Copy certificates from /tmp/acme_certs to backup directory
-        let output = Command::new("cp")
-            .args(&["-r", tmp_acme_dir, &backup_dir])
-            .output();
-        
-        match output {
-            Ok(output) => {
-                if output.status.success() {
-                    println!("Backed up ACME certificates from {} to {}", tmp_acme_dir, backup_dir);
-                } else {
-                    println!("Warning: Failed to backup ACME certificates: {}", String::from_utf8_lossy(&output.stderr));
-                }
-            }
-            Err(e) => {
-                println!("Warning: Failed to execute backup command: {}", e);
-            }
-        }
-    }
 
     /// Get or create a certificate for the given domain
     pub async fn get_certificate(&self, domain: &str) -> Result<Arc<CertifiedKey>, AcmeError> {
@@ -657,10 +615,6 @@ impl AcmeClient {
             .map_err(|e| AcmeError::Certificate(e))?;
         
         println!("Successfully converted ACME certificate to rustls format");
-        
-        // Backup certificates from /tmp/acme_certs to appropriate backup directory
-        self.backup_acme_certificates();
-        
         Ok(Arc::new(certified_key))
     }
     
