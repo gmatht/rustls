@@ -6,6 +6,7 @@
 
 set -e  # Exit on any error
 
+# Set to "--staging" to use Let's Encrypt staging environment, "" for production
 STAGING_FLAG=""
 VERBOSE=-v
 KEEPALIVE=y

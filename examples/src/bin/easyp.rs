@@ -121,7 +121,8 @@ struct Args {
     port: u16,
 
     /// ACME directory URL (legacy, use --staging instead)
-    #[arg(long, default_value = "https://acme-staging-v02.api.letsencrypt.org/directory")]
+
+    #[arg(long, default_value = "https://acme-v02.api.letsencrypt.org/directory")]
     acme_directory: String,
 
     /// Email address for ACME account (legacy, use --email instead)
