@@ -97,6 +97,7 @@ impl OnDemandHttpsServer {
                    renewal_threshold_days: 30,
                    challenge_type: ChallengeType::Http01,
                    is_staging: args.acme_directory.contains("staging") || args.acme_directory.contains("stg"),
+                   bogus_domain: None,
                };
 
                    let mut acme_client = AcmeClient::new(acme_config);

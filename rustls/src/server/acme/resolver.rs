@@ -162,6 +162,8 @@ impl OnDemandCertResolver {
 
     /// Get or create a certificate for the given domain
     async fn get_or_create_certificate(&self, domain: &str) -> Result<Arc<CertifiedKey>, AcmeError> {
+        println!("🔍 get_or_create_certificate called for domain: {}", domain);
+        
         // Check cache first
         {
             let cache = self.cert_cache.read().await;
@@ -389,6 +391,7 @@ impl ResolvesServerCert for OnDemandCertResolver {
         };
 
         // Run async operations in the tokio runtime
+        println!("🔍 Resolver: About to call get_or_create_certificate for domain: {}", domain);
         match rt.block_on(self.get_or_create_certificate(domain)) {
             Ok(certified_key) => {
                 println!("Certificate obtained for domain: {}", domain);

@@ -30,6 +30,8 @@ members = [
 exclude = [
   # `cargo fuzz` integration (requires nightly)
   "fuzz",
+  # acme-lib is a separate project
+  "acme-lib",
 ]
 
 default-members = [
@@ -40,7 +42,7 @@ default-members = [
 resolver = "2"
 
 [workspace.dependencies]
-acme-lib = "0.9"
+acme-lib = "0.9.1"
 anyhow = "1.0.73"
 asn1 = "0.22"
 async-trait = "0.1.74"

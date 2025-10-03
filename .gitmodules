@@ -1,0 +1,3 @@
+[submodule "acme-lib"]
+	path = acme-lib
+	url = git@github.com:gmatht/acme-lib.git

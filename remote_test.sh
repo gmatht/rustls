@@ -56,7 +56,7 @@ source ~/.cargo/env
 
 # Build if needed
 [ -f target/debug/easyp ] || RUSTC_WRAPPER= cargo build --bin easyp
-if [ -z "$(find examples/src/ -type f -newer target/debug/easyp 2>/dev/null)" ] || RUSTC_WRAPPER= cargo build --bin easyp
+if [ -z "$(find examples/src/ acme-lib/src/ -type f -newer target/debug/easyp 2>/dev/null)" ] || RUSTC_WRAPPER= cargo build --bin easyp
 then
 	echo "DEBUG: Building completed, starting deployment..."
 	
@@ -67,7 +67,7 @@ then
 	rsync -avz target/debug/easyp root@$SRV: && echo "DEBUG: Binary sync completed"
 	
 	echo "DEBUG: Starting server in background..."
-	ssh_exec "pkill easyp;sleep 1;pkill -9 easyp; chmod +x easyp; nohup ./easyp --root /var/www/html $VERBOSE $STAGING_FLAG $BOGUS > server.log 2>&1 &"
+	ssh_exec "pkill easyp; chmod +x easyp; nohup ./easyp --root /var/www/html $VERBOSE $STAGING_FLAG $BOGUS > server.log 2>&1 &"
 	echo "DEBUG: Server startup command sent to remote server"
 	
 	echo "DEBUG: Waiting for server to initialize and certificate generation..."

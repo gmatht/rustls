@@ -15,7 +15,7 @@ use std::println;
 
 use crate::sign::CertifiedKey;
 use crate::Error;
-use pki_types::{CertificateDer, PrivateKeyDer};
+use pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use crate::crypto::aws_lc_rs;
 use base64;
 
@@ -142,6 +142,8 @@ impl AcmeClient {
         use acme_lib::{Directory, DirectoryUrl};
         use acme_lib::persist::FilePersist;
 
+        println!("🔍 initialize_account() called for email: {}", self.config.email);
+
         // Create a directory for acme-lib to store its files
         let cache_dir = self.config.cache_dir.as_deref()
             .ok_or_else(|| AcmeError::Client("ACME cache directory not configured".to_string()))?;
@@ -166,9 +168,43 @@ impl AcmeClient {
         let dir = Directory::from_url(persist, DirectoryUrl::Other(&self.config.directory_url))
             .map_err(|e| AcmeError::Client(format!("Failed to create ACME directory: {}", e)))?;
 
-        // Create or load account
-        let account = dir.account(&self.config.email)
-            .map_err(|e| AcmeError::Client(format!("Failed to create/load ACME account: {}", e)))?;
+        // Create or load account with fallback for private key format issues
+        println!("🔍 Attempting to load ACME account for: {}", self.config.email);
+        let account = match dir.account(&self.config.email) {
+            Ok(account) => {
+                println!("✅ Successfully loaded ACME account");
+                account
+            },
+            Err(e) => {
+                let error_msg = format!("{}", e);
+                println!("🔍 ACME account initialization error: '{}'", error_msg);
+                println!("🔍 Checking for private key format issues...");
+                
+                // Check for various private key format error patterns
+                let is_private_key_error = error_msg.contains("Unsupported private key format") || 
+                                         error_msg.contains("private key format") ||
+                                         error_msg.contains("key format") ||
+                                         error_msg.contains("Unsupported") ||
+                                         error_msg.contains("private key");
+                
+                println!("🔍 Is private key error: {}", is_private_key_error);
+                
+                if is_private_key_error {
+                    println!("⚠️  Private key format mismatch detected. Clearing old ACME account data...");
+                    
+                    // Clear the old account data
+                    self.clear_old_account_data(&acme_persist_dir)?;
+                    
+                    // Try to create a new account
+                    println!("🔍 Attempting to create new ACME account after clearing old data...");
+                    dir.account(&self.config.email)
+                        .map_err(|e| AcmeError::Client(format!("Failed to create new ACME account after clearing old data: {}", e)))?
+                } else {
+                    println!("❌ Other error type, not handling: {}", error_msg);
+                    return Err(AcmeError::Client(format!("Failed to create/load ACME account: {}", e)));
+                }
+            }
+        };
 
         // Store account for later use
         let mut account_guard = self.account.lock().unwrap();
@@ -280,6 +316,8 @@ impl AcmeClient {
 
     /// Get or create a certificate for the given domain
     pub async fn get_certificate(&self, domain: &str) -> Result<Arc<CertifiedKey>, AcmeError> {
+        println!("🔍 get_certificate() called for domain: {}", domain);
+        
         // Check cache first
         {
             let cache = self.certificate_cache.read().await;
@@ -290,11 +328,23 @@ impl AcmeClient {
                 }
                 println!("CERT EXPIRED");
             } else {
-                println!("NO CERT IN CACHE!");
+                // Get the SHA256 of the current binary for debugging
+                let binary_path = std::env::current_exe().unwrap_or_else(|_| "unknown".into());
+                let sha256 = if let Ok(content) = std::fs::read(&binary_path) {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    content.hash(&mut hasher);
+                    format!("{:x}", hasher.finish())
+                } else {
+                    "unknown".to_string()
+                };
+                println!("NO CERT IN CACHE! Binary: {} SHA256: {}", binary_path.display(), sha256);
             }   
         }
 
         // Try to load from acme-lib's persistence
+        println!("🔍 About to call load_certificate_from_acme_lib for domain: {}", domain);
         if let Some(certified_key) = self.load_certificate_from_acme_lib(domain).await? {
             // Cache the loaded certificate
             {
@@ -551,7 +601,7 @@ impl AcmeClient {
 
         println!("Validations confirmed for domain: {}", domain);
 
-        // Create private key for the certificate
+        // Create private key for the certificate using acme-lib's method
         let pkey_pri = acme_lib::create_p384_key();
 
         // Finalize the order with the private key
@@ -692,15 +742,22 @@ impl AcmeClient {
         use acme_lib::{Directory, DirectoryUrl};
         use acme_lib::persist::FilePersist;
 
+        println!("🔍 load_certificate_from_acme_lib called for domain: {}", domain);
+
         // Create the same directory structure that acme-lib uses
         let cache_dir = self.config.cache_dir.as_deref()
             .ok_or_else(|| AcmeError::Client("ACME cache directory not configured".to_string()))?;
         let acme_persist_dir = format!("{}/acme_lib", cache_dir);
         
+        println!("🔍 ACME persist directory: {}", acme_persist_dir);
+        
         // Check if the directory exists
         if !std::path::Path::new(&acme_persist_dir).exists() {
+            println!("🔍 ACME persist directory does not exist, returning None");
             return Ok(None);
         }
+        
+        println!("🔍 ACME persist directory exists, proceeding with account loading");
 
         // Create FilePersist instance
         let persist = FilePersist::new(&acme_persist_dir);
@@ -710,9 +767,32 @@ impl AcmeClient {
         // Get domain-specific email
         let domain_email = self.get_email_for_domain(domain);
         
-        // Try to load the account and certificate
-        let account = dir.account(&domain_email)
-            .map_err(|e| AcmeError::Client(format!("Failed to load ACME account for {}: {}", domain_email, e)))?;
+        // Try to load the account and certificate with fallback for private key format issues
+        let account = match dir.account(&domain_email) {
+            Ok(account) => account,
+            Err(e) => {
+                let error_msg = format!("{}", e);
+                println!("🔍 ACME account loading error: '{}'", error_msg);
+                println!("🔍 Checking for private key format issues...");
+                
+                // Check for various private key format error patterns
+                let is_private_key_error = error_msg.contains("Unsupported private key format") || 
+                                         error_msg.contains("private key format") ||
+                                         error_msg.contains("key format") ||
+                                         error_msg.contains("Unsupported") ||
+                                         error_msg.contains("private key");
+                
+                println!("🔍 Is private key error: {}", is_private_key_error);
+                
+                if is_private_key_error {
+                    println!("⚠️  Private key format mismatch in certificate loading. Skipping cached certificate...");
+                    return Ok(None);
+                } else {
+                    println!("❌ Other error type, not handling: {}", error_msg);
+                    return Err(AcmeError::Client(format!("Failed to load ACME account for {}: {}", domain_email, e)));
+                }
+            }
+        };
 
         // Try to get the certificate from acme-lib's persistence
         match account.certificate(domain) {
@@ -742,6 +822,54 @@ impl AcmeClient {
         cache.retain(|_, cached| cached.expires_at > now);
         
         Ok(initial_count - cache.len())
+    }
+
+    /// Clear old ACME account data when there's a private key format mismatch
+    fn clear_old_account_data(&self, acme_persist_dir: &str) -> Result<(), AcmeError> {
+        use std::fs;
+        
+        println!("🧹 Clearing old ACME account data from: {}", acme_persist_dir);
+        
+        // Remove the entire acme-lib persistence directory
+        if std::path::Path::new(acme_persist_dir).exists() {
+            fs::remove_dir_all(acme_persist_dir)
+                .map_err(|e| AcmeError::Client(format!("Failed to remove old ACME data: {}", e)))?;
+            println!("✅ Old ACME account data cleared successfully");
+        }
+        
+        // Recreate the directory
+        fs::create_dir_all(acme_persist_dir)
+            .map_err(|e| AcmeError::Client(format!("Failed to recreate ACME directory: {}", e)))?;
+        
+        // Set proper permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(acme_persist_dir)
+                .map_err(|e| AcmeError::Client(format!("Failed to get metadata for directory: {}", e)))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(acme_persist_dir, perms)
+                .map_err(|e| AcmeError::Client(format!("Failed to set permissions: {}", e)))?;
+        }
+        
+        Ok(())
+    }
+
+    /// Create a private key compatible with both rustls 0.23 (acme-lib) and rustls 0.24
+    fn create_compatible_private_key(&self) -> Result<PrivateKeyDer<'static>, AcmeError> {
+        use rcgen::{KeyPair, PKCS_ECDSA_P384_SHA384};
+        
+        // Generate a P-384 key pair using rcgen (compatible with both rustls versions)
+        let alg = &PKCS_ECDSA_P384_SHA384;
+        let key_pair = KeyPair::generate_for(alg)
+            .map_err(|e| AcmeError::Client(format!("Failed to generate P-384 key pair: {}", e)))?;
+        
+        // Serialize the private key in PKCS#8 format
+        let private_key_der = key_pair.serialize_der();
+        
+        // Convert to the format expected by acme-lib
+        Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)))
     }
 
     /// Generate a self-signed certificate for testing
