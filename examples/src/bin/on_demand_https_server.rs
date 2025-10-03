@@ -41,9 +41,9 @@ struct Args {
     #[arg(long, default_value = "https://acme-staging-v02.api.letsencrypt.org/directory")]
     acme_directory: String,
 
-    /// Email address for ACME account
-    #[arg(long, default_value = "admin@example.com")]
-    acme_email: String,
+           /// Email address for ACME account (defaults to webmaster@domain for each domain)
+           #[arg(long)]
+           acme_email: Option<String>,
 
     /// Challenge type (http01 or dns01)
     #[arg(long, default_value = "http01")]
@@ -91,7 +91,7 @@ impl OnDemandHttpsServer {
                let (cert_resolver, acme_client) = {
                let acme_config = AcmeConfig {
                    directory_url: args.acme_directory.clone(),
-                   email: args.acme_email.clone(),
+                   email: args.acme_email.clone().unwrap_or_else(|| "admin@example.com".to_string()),
                    allowed_ips: allowed_ips.clone(),
                    cache_dir: args.cache_dir.clone(),
                    renewal_threshold_days: 30,

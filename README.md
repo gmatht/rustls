@@ -1,226 +1,422 @@
-<p align="center">
-  <img width="460" height="300" src="https://raw.githubusercontent.com/rustls/rustls/main/admin/rustls-logo-web.png">
-</p>
+# EasyPeas HTTPS Server
 
-<p align="center">
-Rustls is a modern TLS library written in Rust.
-</p>
+| ![Logo](logo.png) | I gave up trying to configure off-the-shelf webservers and decided it would be easier to just write my own that just automatically configured itself. This prototype should just work, provided you have already set up Lets Encrypt. <br><br>It supports extensions written in Rust, and comes with some default examples. Just add/remove extension `.rs` files to/from `extensions/` and run `cargo build --release` to get a single binary staticly linked with all your extensions. Then just run that binary on your server or run the `deploy.sh` script to set up systemd etc.<br> |
+|:---:|:---|
 
-# Status
+At this point it should just work, and if it doesn't work on Linux it is a bug; however, no benchmarking has been done and only the most cursory security analysis.
 
-Rustls is used in production at many organizations and projects. We aim to maintain
-reasonable API surface stability but the API may evolve as we make changes to accommodate
-new features or performance improvements.
+*My favourite type of peas is HTT Ps*
+## Features
 
-We have a [roadmap](ROADMAP.md) for our future plans. We also have [benchmarks](BENCHMARKING.md) to
-prevent performance regressions and to let you evaluate rustls on your target hardware.
+- **ACME Integration**: Built-in Let's Encrypt certificate management (no certbot required!)
+- **Automatic Domain Discovery**: Scans `/etc/letsencrypt/live/` for domains or uses ACME
+- **Dual Protocol Support**: Serves both HTTP (port 80) and HTTPS (port 443)
+- **Static File Serving**: Serves files from `/var/www/{domain}/` for each domain
+   * Falls back to /var/www/html
+- **Let's Encrypt Integration**: Uses fullchain.pem and privkey.pem certificates
+- **HTTP-01 Challenge Support**: Handles ACME domain validation challenges
+- **Automatic Certificate Renewal**: Background task for certificate management
+- **Extension System**: Modular architecture with multiple extension types
+- **Comment System**: Example extensions implementing commenting with moderation capabilities
+- **Admin Panels**: Secure admin interfaces for content management
+- **Privilege Dropping**: Drops to `www-data` after initialization for security
+- **CGI-like Support**: Executes statically compile and linked CGI-like scripts for dynamic content
+- **MIME Type Support**: Proper content types for common file formats
+- **Comprehensive Logging**: Detailed request and error logging
 
-If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+## Requirements
 
-[![Build Status](https://github.com/rustls/rustls/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/rustls/rustls/actions/workflows/build.yml?query=branch%3Amain)
-[![Coverage Status (codecov.io)](https://codecov.io/gh/rustls/rustls/branch/main/graph/badge.svg)](https://codecov.io/gh/rustls/rustls/)
-[![Documentation](https://docs.rs/rustls/badge.svg)](https://docs.rs/rustls/)
-[![Chat](https://img.shields.io/discord/976380008299917365?logo=discord)](https://discord.gg/MCSB76RU96)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/9034/badge)](https://www.bestpractices.dev/projects/9034)
+- Rust 1.70+
+- Let's Encrypt certificates in `/etc/letsencrypt/live/` (or use ACME mode)
+- Document roots in `/var/www/{domain}/`
+- Root privileges to bind to port 443
 
-The maintainers pronounce "rustls" as rustles (rather than rust-TLS), but we don't feel strongly
-about it.
+## Extension System
 
-## Changelog
+EasyPeas features a powerful modular extension system with four types of extensions:
 
-The detailed list of changes in each release can be found at
-https://github.com/rustls/rustls/releases.
+### Extension Types
 
-# Documentation
+1. **`.expand.rs`** - Content expansion extensions that modify HTML content
+2. **`.bin.rs`** - CGI-bin like extensions for dynamic content generation
+3. **`.root.rs`** - Root-level extensions that run before privilege dropping
+4. **`.admin.rs`** - Admin panel extensions for content management
 
-https://docs.rs/rustls/
+Drop these files into `extensions/` at compile time to have you extensions linked into your single file webserver.
 
-# Approach
+### Built-in Example Extensions
 
-Rustls is a TLS library that aims to provide a good level of cryptographic security,
-requires no configuration to achieve that security, and provides no unsafe features or
-obsolete cryptography by default.
+#### Comment System (`comment.*`)
+- **`comment.expand.rs`**: Adds comment forms and displays live comments
+- **`comment.bin.rs`**: Handles comment submission via CGI-like API
+- **`comment.root.rs`**: Sets up comment directories and permissions
+- **`comment.admin.rs`**: Provides comment moderation interface
 
-Rustls implements TLS1.2 and TLS1.3 for both clients and servers. See [the full
-list of protocol features](https://docs.rs/rustls/latest/rustls/manual/_04_features/index.html).
+#### Math Extension (`math.expand.rs`)
+- Converts `#EXPAND:math(op,i,j)` blocks to rendered math, where op can be e.g. "add"
 
-### Platform support
+#### Example Extension (`example.expand.rs`)
+- Demonstrates basic extension functionality
+- Adds example content to pages
 
-While Rustls itself is platform independent, it requires the use of cryptography primitives
-for implementing the cryptography algorithms used in TLS. In Rustls, a
-[`crypto::CryptoProvider`] represents a collection of crypto primitive implementations.
+### Creating Custom Extensions
 
-The Rustls team recommends using the [`aws-lc-rs`] crate, which for its complete feature set
-and performance. See [the aws-lc-rs FAQ][aws-lc-rs-platforms-faq] for more details of the
-platform/architecture support constraints in aws-lc-rs.
+Extensions are automatically discovered by the build system. To create a new extension:
 
-[`ring`] is also available via the `ring` crate feature: see
-[the supported `ring` target platforms][ring-target-platforms].
+1. Add a `.rs` file to the `extensions/` directory with the appropriate suffix
+2. Implement the required trait methods
+3. The build system will automatically compile and register your extension
 
-By providing a custom instance of the [`crypto::CryptoProvider`] struct, you
-can replace all cryptography dependencies of rustls.  This is a route to being portable
-to a wider set of architectures and environments, or compliance requirements.  See the
-[`crypto::CryptoProvider`] documentation for more details.
+#### Example: Custom Expand Extension
 
-Rustls requires Rust 1.83 or later.
+```rust
+// extensions/my_extension.expand.rs
+use std::collections::HashMap;
 
-[ring-target-platforms]: https://github.com/briansmith/ring/blob/2e8363b433fa3b3962c877d9ed2e9145612f3160/include/ring-core/target.h#L18-L64
-[`crypto::CryptoProvider`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html
-[`ring`]: https://crates.io/crates/ring
-[aws-lc-rs-platforms-faq]: https://aws.github.io/aws-lc-rs/faq.html#can-i-run-aws-lc-rs-on-x-platform-or-architecture
-[`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs
-
-### Cryptography providers
-
-Since Rustls 0.22 it has been possible to choose the provider of the cryptographic primitives
-that Rustls uses. This may be appealing if you have specific platform, compliance or feature
-requirements.
-
-Users that wish to customize the provider in use can do so when constructing `ClientConfig`
-and `ServerConfig` instances using the `with_crypto_provider` method on the respective config
-builder types. See the [`crypto::CryptoProvider`] documentation for more details.
-
-#### Built-in providers
-
-Rustls ships with two built-in providers controlled by associated crate features:
-
-* [`aws-lc-rs`] - available with the `aws-lc-rs` crate feature enabled
-* [`ring`] - available with the `ring` crate feature enabled
-
-See the documentation for [`crypto::CryptoProvider`] for details on how providers are
-selected.
-
-#### Third-party providers
-
-The community has also started developing third-party providers for Rustls:
-
-* [`boring-rustls-provider`] - a work-in-progress provider that uses [`boringssl`] for
-cryptography.
-* [`rustls-graviola`] - a provider that uses [`graviola`] for cryptography.
-* [`rustls-mbedtls-provider`] - a provider that uses [`mbedtls`] for cryptography.
-* [`rustls-openssl`] - a provider that uses [OpenSSL] for cryptography.
-* [`rustls-rustcrypto`] - an experimental provider that uses the crypto primitives
-from [`RustCrypto`] for cryptography.
-* [`rustls-symcrypt`] - a provider that uses Microsoft's [SymCrypt] library.
-* [`rustls-wolfcrypt-provider`] - a work-in-progress provider that uses [`wolfCrypt`] for cryptography.
-
-[`rustls-graviola`]: https://crates.io/crates/rustls-graviola
-[`graviola`]: https://github.com/ctz/graviola
-[`rustls-mbedtls-provider`]: https://github.com/fortanix/rustls-mbedtls-provider
-[`mbedtls`]: https://github.com/Mbed-TLS/mbedtls
-[`rustls-openssl`]: https://github.com/tofay/rustls-openssl
-[OpenSSL]: https://openssl-library.org/
-[`rustls-symcrypt`]: https://github.com/microsoft/rustls-symcrypt
-[SymCrypt]: https://github.com/microsoft/SymCrypt
-[`boring-rustls-provider`]: https://github.com/janrueth/boring-rustls-provider
-[`boringssl`]: https://github.com/google/boringssl
-[`rustls-rustcrypto`]: https://github.com/RustCrypto/rustls-rustcrypto
-[`RustCrypto`]: https://github.com/RustCrypto
-[`rustls-wolfcrypt-provider`]: https://github.com/wolfSSL/rustls-wolfcrypt-provider
-[`wolfCrypt`]: https://www.wolfssl.com/products/wolfcrypt
-
-#### Custom provider
-
-We also provide a simple example of writing your own provider in the [custom provider example].
-This example implements a minimal provider using parts of the [`RustCrypto`] ecosystem.
-
-See the [Making a custom CryptoProvider] section of the documentation for more information
-on this topic.
-
-[custom provider example]: https://github.com/rustls/rustls/tree/main/provider-example/
-[`RustCrypto`]: https://github.com/RustCrypto
-[Making a custom CryptoProvider]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html#making-a-custom-cryptoprovider
-
-# Example code
-
-Our [examples] directory contains demos that show how to handle I/O using the
-[`stream::Stream`] helper, as well as more complex asynchronous I/O using [`mio`].
-If you're already using Tokio for an async runtime you may prefer to use
-[`tokio-rustls`] instead of interacting with rustls directly.
-
-The [`mio`] based examples are the most complete, and discussed below. Users
-new to Rustls may prefer to look at the simple client/server examples before
-diving in to the more complex MIO examples.
-
-[examples]: examples/
-[`stream::Stream`]: https://docs.rs/rustls/latest/rustls/struct.Stream.html
-[`mio`]: https://docs.rs/mio/latest/mio/
-[`tokio-rustls`]: https://docs.rs/tokio-rustls/latest/tokio_rustls/
-
-## Client example program
-
-The MIO client example program is named `tlsclient-mio`.
-
-Some sample runs:
-
-```
-$ cargo run --bin tlsclient-mio -- --http mozilla-modern.badssl.com
-HTTP/1.1 200 OK
-Server: nginx/1.6.2 (Ubuntu)
-Date: Wed, 01 Jun 2016 18:44:00 GMT
-Content-Type: text/html
-Content-Length: 644
-(...)
+pub fn extend(url: &str, args: &str) -> String {
+    // Your extension logic here
+    format!("<div>Custom content for {}</div>", url)
+}
 ```
 
-or
+## Installation
+
+1. Clone or download this project
+2. Build the server:
+   ```bash
+   cargo build --release
+   ```
+3. Deploy using the included script:
+   ```bash
+   ./deploy.sh user@your-server.com
+   ```
+
+## Usage
+
+### ACME Mode (Recommended)
+
+1. Create document roots for your domains:
+   ```bash
+   sudo mkdir -p /var/www/example.com
+   echo "<h1>Hello from example.com!</h1>" | sudo tee /var/www/example.com/index.html
+   ```
+
+2. Run the server with ACME certificate management:
+   ```bash
+   # Email defaults to webmaster@$HOSTNAME (if hostname contains a dot) or webmaster@domain (shortest domain from reverse DNS) or webmaster@localhost
+   # Staging defaults to false (production Let's Encrypt)
+   
+   # Run with domain list
+   sudo ./target/release/easypeas example.com another-domain.com
+   ```
+
+3. For testing, use the staging environment:
+   ```bash
+   export ACME_STAGING="true"
+   sudo ./target/release/easypeas example.com another-domain.com
+   ```
+
+4. Customize the email address:
+   ```bash
+   export ACME_EMAIL="admin@example.com"
+   sudo ./target/release/easypeas example.com another-domain.com
+   ```
+
+### Legacy Mode (Let's Encrypt Directory)
+
+1. Ensure your Let's Encrypt certificates are in place:
+   ```
+   /etc/letsencrypt/live/example.com/fullchain.pem
+   /etc/letsencrypt/live/example.com/privkey.pem
+   ```
+
+2. Create document roots for your domains:
+   ```bash
+   sudo mkdir -p /var/www/example.com
+   echo "<h1>Hello from example.com!</h1>" | sudo tee /var/www/example.com/index.html
+   ```
+
+3. Run the server (requires root for port 443):
+   ```bash
+   sudo ./target/release/easypeas
+   ```
+
+   Or use the systemd service (if deployed):
+   ```bash
+   sudo systemctl start easypeas
+   sudo systemctl enable easypeas  # Start on boot
+   ```
+
+4. Visit your domains:
+   - http://example.com (HTTP on port 80)
+   - https://example.com (HTTPS on port 443)
+   - http://another-domain.com
+   - https://another-domain.com
+
+## Comment System
+
+EasyPeas includes a complete commenting system with moderation capabilities:
+
+### Features
+- **Comment Forms**: Automatically replaces '#EXPAND:comment()' in served html files
+- **Live Comments**: Accepted comments appear immediately on the page
+- **Moderation**: Admin interface for approving/rejecting comments
+- **Security**: Comments are sanitized and validated
+- **Storage**: Comments stored in `/var/spool/easypeas/comments/`
+
+### Admin Panel
+- Access via secret URL: `https://your-domain.com/comment_{admin_key}`
+- Admin key is generated automatically on first run and stored in /var/spool/easypeas.admin
+- Batch moderation with checkboxes
+
+## Admin System
+
+EasyPeas provides secure admin panels for content management:
+
+### Admin Key Management
+- Keys are generated dynamically on first run
+- Stored in `/var/spool/easypeas/admin`
+- Keys are cached in memory for security
+- Each extension gets its own unique admin key
+- go to https://example.com/KEY to administer system.
+
+### Security Features
+- Admin keys are long, random alphanumeric strings
+- Admin panels only accessible with correct keys
+- Privilege dropping ensures admin operations run as `www-data`
+
+## Configuration
+
+### ACME Configuration
+
+The server supports two modes of operation:
+
+**ACME Mode (Default when domains are specified):**
+- Automatically requests Let's Encrypt certificates for specified domains
+- Handles HTTP-01 challenges for domain validation
+- Stores certificates in `/var/lib/easypeas/certs/`
+- Automatically renews certificates before expiration
+- Uses staging environment by default (set `ACME_STAGING=false` for production)
+
+**Legacy Mode (Fallback):**
+- Scans `/etc/letsencrypt/live/` for existing domains
+- Uses pre-existing certificates from certbot or other tools
+- No automatic certificate management
+
+### Environment Variables
+
+- `ACME_EMAIL`: Email address for Let's Encrypt registration (defaults to `webmaster@$HOSTNAME` if hostname contains a dot, otherwise `webmaster@domain` where domain is the shortest domain found by reverse DNS, or `webmaster@localhost` as final fallback)
+- `ACME_STAGING`: Set to "true" for staging Let's Encrypt environment (defaults to "false" for production)
+- `ENABLE_DNS_DISCOVERY`: Enable automatic hostname discovery via DNS (defaults to "true")
+
+### General Configuration
+
+The server automatically:
+- Serves files from `/var/www/{domain}/` for each domain
+- Uses the first domain found as the default domain
+- Maps file extensions to appropriate MIME types
+- Handles ACME HTTP-01 challenges at `/.well-known/acme-challenge/`
+
+## Supported File Types
+
+- HTML: `.html`
+- CSS: `.css`
+- JavaScript: `.js`
+- JSON: `.json`
+- WASM: `.wasm`
+- Images: `.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.ico`
+- Text: `.txt`
+- Default: `application/octet-stream`
+
+## Security Notes
+
+- This is a basic implementation for development/testing
+- In production, consider additional security measures
+- Ensure proper file permissions on document roots
+- Consider rate limiting and access controls
+
+## Testing
+
+The project includes test scripts for different platforms:
+- `setup_example.sh`: Sets up example domains and content (Linux/macOS)
+- `test_server.sh`: Creates test environment with self-signed certificates (Linux/macOS)
+- `test_server.bat`: Windows batch script for test environment setup
+- `test_server.ps1`: PowerShell script for test environment setup (Not sure that this would work on Windows though)
+
+### Linux/macOS Testing
+```bash
+# Run the bash test script
+chmod +x test_server.sh
+./test_server.sh
+
+#Test on a remote server
+./remote_tesh.sh example.com
+
+# Build and run the server
+cargo build --release
+sudo ./target/release/easypeas
+```
+
+## Deployment
+
+### Automated Deployment
+
+Use the included `deploy.sh` script for easy deployment:
+
+```bash
+./deploy.sh user@your-server.com
+```
+
+This script will:
+1. Build the release binary
+2. Copy it to the target server
+3. Install it to `/usr/local/bin/easypeas`
+4. Create and enable a systemd service
+5. Set up proper security configurations
+
+### Manual Deployment
+
+1. Build the binary:
+   ```bash
+   cargo build --release
+   ```
+
+2. Copy to target server:
+   ```bash
+   scp target/release/easypeas user@server:/usr/local/bin/
+   ```
+
+3. Set permissions:
+   ```bash
+   ssh user@server "sudo chmod +x /usr/local/bin/easypeas"
+   ```
+
+4. Create systemd service (see `deploy.sh` for the service file)
+
+### Systemd Service
+
+The EasyPeas service includes:
+- Automatic restart on failure
+- Security hardening (NoNewPrivileges, PrivateTmp, etc.)
+- Proper file system access controls
+- Journal logging
+
+Service management:
+```bash
+sudo systemctl start easypeas      # Start service
+sudo systemctl stop easypeas       # Stop service
+sudo systemctl restart easypeas    # Restart service
+sudo systemctl status easypeas     # Check status
+sudo journalctl -u easypeas -f     # View logs
+```
+
+## Performance Optimization
+
+The project includes optimized build profiles:
+
+- **Development**: Fast compilation with debug info
+- **Test**: Balanced optimization for testing
+- **Release**: Maximum optimization with LTO, size optimization, and stripped symbols
+
+### Binary Sizes
+- Debug build: ~62 MB
+- Release build: ~4.9 MB
+
+The release profile uses:
+- `lto = "fat"`: Full Link Time Optimization
+- `codegen-units = 1`: Single codegen unit for better optimization
+- `opt-level = "z"`: Optimize for size
+- `strip = true`: Remove debug symbols
+- `panic = "abort"`: Smaller binary size
+
+## File Structure
 
 ```
-$ cargo run --bin tlsclient-mio -- --http expired.badssl.com
-TLS error: InvalidCertificate(Expired)
-Connection closed
+EasyPeas_HTTPS/
+├── src/                    # Source code
+│   ├── main.rs            # Main server implementation
+│   └── cgi_env.rs         # CGI environment utilities
+├── extensions/            # Extension modules
+│   ├── comment.*.rs       # Comment system extensions
+│   ├── math.expand.rs     # Math rendering extension
+│   └── example.expand.rs  # Example extension
+├── target/                # Build output
+│   └── release/easypeas   # Compiled binary
+├── deploy.sh              # Deployment script
+├── Cargo.toml            # Rust project configuration
+└── README.md             # This file
 ```
 
-Run `cargo run --bin tlsclient-mio -- --help` for more options.
-
-## Server example program
-
-The MIO server example program is named `tlsserver-mio`.
-
-Here's a sample run; we start a TLS echo server, then connect to it with
-`openssl` and `tlsclient-mio`:
+## Directory Structure (Server)
 
 ```
-$ cargo run --bin tlsserver-mio -- --certs test-ca/rsa-2048/end.fullchain --key test-ca/rsa-2048/end.key -p 8443 echo &
-$ echo hello world | openssl s_client -ign_eof -quiet -connect localhost:8443
-depth=2 CN = ponytown RSA CA
-verify error:num=19:self signed certificate in certificate chain
-hello world
-^C
-$ echo hello world | cargo run --bin tlsclient-mio -- --cafile test-ca/rsa-2048/ca.cert --port 8443 localhost
-hello world
-^C
+/var/www/{domain}/         # Document roots for each domain
+/etc/letsencrypt/live/     # Let's Encrypt certificates
+/var/spool/easypeas/       # EasyPeas data directory
+├── admin                 # Admin keys file
+└── comments/             # Comment system storage
+    ├── in               # Incoming comments
+    ├── processing       # Comments awaiting moderation
+    ├── accept           # Accepted comments
+    ├── reject           # Rejected comments
+    └── live/             # Live comments by URL hash
 ```
 
-Run `cargo run --bin tlsserver-mio -- --help` for more options.
+## Troubleshooting
 
-# License
+### Common Issues
 
-Rustls is distributed under the following three licenses:
+1. **Permission Denied on Port 443**
+   - Ensure running as root or with sudo
+   - Check if another service is using port 443
+
+2. **Certificate Not Found**
+   - For ACME mode: Ensure domains are specified as command line arguments
+   - For legacy mode: Verify certificates exist in `/etc/letsencrypt/live/{domain}/`
+   - Check file permissions (should be readable by root)
+   - Ensure ACME_EMAIL environment variable is set for ACME mode
+
+3. **Admin Panel Not Accessible**
+   - Check admin key in `/var/spool/easypeas/admin`
+   - Verify URL format: `https://domain.com/extension_{key}`
+
+4. **Comments Not Appearing**
+   - Check comment moderation in admin panel
+   - Verify `/var/spool/easypeas/comments/` directory permissions
+   - Ensure `www-data` user has write access
+
+5. **Extensions Not Loading**
+   - Check build output for compilation errors
+   - Verify extension files are in `extensions/` directory
+   - Ensure proper trait implementations
+
+6. **ACME Certificate Issues**
+   - Verify domain is accessible from the internet
+   - Check that port 80 is open for HTTP-01 challenges
+   - Ensure ACME_EMAIL is set correctly
+   - Use staging environment first (`ACME_STAGING=true`)
+   - Check certificate directory permissions: `/var/lib/easypeas/certs/`
+
+### Debugging
+
+- Check server logs: `sudo journalctl -u easypeas -f`
+- Verify file permissions: `ls -la /var/spool/easypeas/comments/`
+- Test admin access: `curl -k https://domain.com/comment_{key}`
+- Check certificate validity: `openssl x509 -in /etc/letsencrypt/live/domain/fullchain.pem -text -noout`
+
+### LICENSE:
+
+The easyp webserver is distributed under the GPLv3. 
+
+The library this was forked from was licensed under
 
 - Apache License version 2.0.
 - MIT license.
 - ISC license.
 
-These are included as LICENSE-APACHE, LICENSE-MIT and LICENSE-ISC
-respectively.  You may use this software under the terms of any
-of these licenses, at your option.
+The GPLv3 is liberal enough for what most normal people would want to do with a webserver, including most commericial purposes.  If you want to distribute under a license other than GPLv3 feel free to drop me a line. Alternatively just use the permissively licensed upstream library at https://github.com/rustls/rustls
 
-# Project Membership
-
-- Joe Birr-Pixton ([@ctz], Project Founder - full-time funded by [Prossimo])
-- Dirkjan Ochtman ([@djc], Co-maintainer)
-- Daniel McCarney ([@cpu], Co-maintainer)
-- Josh Aas ([@bdaehlie], Project Management)
-
-[@ctz]: https://github.com/ctz
-[@djc]: https://github.com/djc
-[@cpu]: https://github.com/cpu
-[@bdaehlie]: https://github.com/bdaehlie
-[Prossimo]: https://www.memorysafety.org/initiative/rustls/
-
-# Code of conduct
-
-This project adopts the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).
-Please email rustls-mod@googlegroups.com to report any instance of misconduct, or if you
-have any comments or questions on the Code of Conduct.
+### TODO:
+- Security Audit
+- Supply security updates via some secure channel.
+- Investigate feasibility of automatic free subdomain instead of self-signed cert fallback.

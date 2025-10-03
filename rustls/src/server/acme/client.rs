@@ -138,20 +138,31 @@ impl AcmeClient {
     pub async fn initialize_account(&mut self) -> Result<(), AcmeError> {
         use acme_lib::{Directory, DirectoryUrl};
         use acme_lib::persist::MemoryPersist;
-        
+
         // Create ACME directory
         let persist = MemoryPersist::new();
         let dir = Directory::from_url(persist, DirectoryUrl::Other(&self.config.directory_url))
             .map_err(|e| AcmeError::Client(format!("Failed to create ACME directory: {}", e)))?;
-        
+
         // Create or load account
         let account = dir.account(&self.config.email)
             .map_err(|e| AcmeError::Client(format!("Failed to create/load ACME account: {}", e)))?;
-        
+
         // Store account for later use
         self.account = Some(account);
-        
+
         Ok(())
+    }
+
+    /// Get the email address for a specific domain
+    fn get_email_for_domain(&self, domain: &str) -> String {
+        // If a specific email is configured, use it
+        if !self.config.email.is_empty() && self.config.email != "admin@example.com" {
+            return self.config.email.clone();
+        }
+        
+        // Otherwise, generate webmaster@domain
+        format!("webmaster@{}", domain)
     }
 
     /// Store challenge data for HTTP-01 challenges
@@ -250,9 +261,20 @@ impl AcmeClient {
             }
         }
 
-        // Get account or return error
-        let account = self.account.as_ref()
-            .ok_or_else(|| AcmeError::Client("ACME account not initialized".to_string()))?;
+        // Get domain-specific email
+        let domain_email = self.get_email_for_domain(domain);
+        println!("Using email for domain {}: {}", domain, domain_email);
+
+        // Create ACME directory and account for this domain
+        use acme_lib::{Directory, DirectoryUrl};
+        use acme_lib::persist::MemoryPersist;
+
+        let persist = MemoryPersist::new();
+        let dir = Directory::from_url(persist, DirectoryUrl::Other(&self.config.directory_url))
+            .map_err(|e| AcmeError::Client(format!("Failed to create ACME directory: {}", e)))?;
+
+        let account = dir.account(&domain_email)
+            .map_err(|e| AcmeError::Client(format!("Failed to create/load ACME account for {}: {}", domain_email, e)))?;
 
         println!("Requesting real ACME certificate for domain: {}", domain);
 
@@ -538,8 +560,10 @@ impl AcmeClient {
         
         // Save metadata
         let metadata_path = format!("{}/{}.meta", cert_dir, domain);
+        let domain_email = self.get_email_for_domain(domain);
         let metadata = serde_json::json!({
             "domain": domain,
+            "email": domain_email,
             "created_at": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
             "is_staging": self.config.is_staging,
             "acme_directory": self.config.directory_url,
