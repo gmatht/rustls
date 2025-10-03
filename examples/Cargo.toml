@@ -30,3 +30,7 @@ serde = { workspace = true }
 tokio = { workspace = true }
 webpki-roots = { workspace = true }
 time = { workspace = true }
+urlencoding = "2.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
