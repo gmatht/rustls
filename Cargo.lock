@@ -840,6 +840,7 @@ dependencies = [
  "log",
  "mio",
  "rcgen",
+ "regex",
  "rustls 0.24.0-dev.0",
  "serde",
  "time 0.3.44",
